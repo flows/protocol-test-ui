@@ -19,8 +19,8 @@ Button(bootstrap/button)
 ClearButton(bootstrap/button)
 
 # TODO: relative paths should always work.
-provider ./graph/{ns}/{name}.fbp as x
-provider ./graph/{name}.fbp as d
+provider ./graphs/{ns}/{name}.fbp as x
+provider ./graphs/{name}.fbp as d
 
 GraphCommands(x:models/model)
 Message(d:protocol/message)

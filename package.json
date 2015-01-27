@@ -19,5 +19,9 @@
   "devDependencies": {
     "chix-flow": "^0.12.0",
     "chix-monitor-npmlog": "0.0.5"
+  },
+  "dependencies": {
+    "domify": "^1.3.1",
+    "mustache": "^1.0.0"
   }
 }
