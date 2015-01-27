@@ -8,7 +8,7 @@ ProtocolSchemas(object/create)
 Log(console/log)
 
 # fbpx graph && fbpx run seem to expect different paths
-'./graph/protocol/all.json!' ~> @in ProtocolSchemas
+'./graphs/schemas/all.json!' ~> @in ProtocolSchemas
 #'../protocol/all.json!' ~> @in ProtocolSchemas
 
 -> in:command CommandKey(object/keys)

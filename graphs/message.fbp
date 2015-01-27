@@ -14,7 +14,7 @@ ToHtml(dom/domify)
 'click' -> @event Click
 '#messages' -> @selector MessageEl
 
-'./views/message.tpl' ~> @body View
+'./graphs/views/message.tpl' ~> @body View
 
 MessageEl selection -> ^element AddMessage
 ToHtml out -> child AddMessage element  -> element Click
