@@ -3,18 +3,18 @@
 Install graph dependencies:
 `fbpx install graphs/ui.fbp`
 
-`fbpx browserify graphs/ui.fbp > example/ui.js`
+`fbpx browserify graphs/ui.fbp > www/ui.js`
 
 Watch:
-`fbpx browserify graphs/ui.fbp --watch -o example/ui.js`
+`fbpx browserify graphs/ui.fbp --watch -o www/ui.js`
 
 Watch and reload with fb-flo:
 
-`fbpx browserify graphs/ui.fbp --watch --browser -o example/ui.js`
+`fbpx browserify graphs/ui.fbp --watch --browser -o www/ui.js`
 
 Serve index.html
-`http-server example/`
+`http-server www/`
 
 Still to implement:
 
-`fbpx serve graphs/ui.fbp --watch --browser -o example/ui.js`
+`fbpx serve graphs/ui.fbp --watch --browser -o www/ui.js`
