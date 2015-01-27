@@ -3741,7 +3741,7 @@ Flow.prototype.getPortDefinition = function(port, type) {
         port,
         this.ns,
         this.name,
-        Object.keys(this.ports[type]).toString()
+        Object.keys(this.ports.input).toString()
       )
     );
   }
@@ -5748,8 +5748,6 @@ function xNode(id, node, identifier, CHI) {
 
   this.state = {};
 
-  this.persist = {};
-
   // remember def for .compile()
   this.def = node;
 
@@ -6593,6 +6591,20 @@ xNode.prototype._fillPort = function(target, p) {
 
   var res;
 
+  // this is too early, defaults do not get filled this way.
+  if (this.ports.input[target.port].async === true &&
+    !this._allConnectedSyncFilled()) {
+
+    this.event(':portReject', {
+      node: this.export(),
+      port: target.port,
+      data: p
+    });
+
+    // do not accept
+    return false;
+  }
+
   if (undefined === p.data) {
     return Error('data may not be `undefined`');
   }
@@ -6606,29 +6618,15 @@ xNode.prototype._fillPort = function(target, p) {
   res = this._validateInput(target.port, p.data);
 
   if (util.isError(res)) {
+
     return res;
+
   }
   else {
 
-    if (target.has('persist')) {
-      // do array index thing here also.
-      this.persist[target.port] = p.data;
-      return true;
-    } else {
-      // this is too early, defaults do not get filled this way.
-      if (this.ports.input[target.port].async === true &&
-        !this._allConnectedSyncFilled()) {
-
-        this.event(':portReject', {
-          node: this.export(),
-          port: target.port,
-          data: p
-        });
-
-        // do not accept
-        console.log('early block');
-        return false;
-      }
+    // todo: this logic must be externalized.
+    // node doesn't know about persist
+    if (!target.has('persist')) {
 
       try {
 
@@ -6846,13 +6844,10 @@ xNode.prototype._readyOrNot = function() {
     }
 
     // Check context/defaults etc. and fill it
-    // should only fill defaults for async ports..
-    // *if* the async port is not connected.
-    var ret = portFiller.fill.call(this,
+    var ret = portFiller.fill(
       this.ports.input,
       this.input,
-      this.context,
-      this.persist
+      this.context
     );
 
     // TODO: if all are async, just skip all the above
@@ -7007,7 +7002,7 @@ xNode.prototype.clearInput = function(port) {
 };
 
 xNode.prototype.freePort = function(port) {
-/*
+
   var persist = this.getPortOption('input', port, 'persist');
   if (persist) {
     // persist, chi, hmz, seeze to exist.
@@ -7016,51 +7011,39 @@ xNode.prototype.freePort = function(port) {
     debug('%s:%s persisting', this.identifier, port);
 
     // indexes are persisted per index.
-    // store inside persit
     if (Array.isArray(persist)) {
-      // TODO: means object is not supported..
-      this.persist[port] = [];
       for (var k in this.input[port]) {
         if (persist.indexOf(k) === -1) {
-          //debug('%s:%s[%s] persisting', this.identifier, port, k);
-          // remove
-          //delete this.input[port][k];
-        } else {
           debug('%s:%s[%s] persisting', this.identifier, port, k);
-          this.perists[port][k] = this.input[port][k];
+          // remove
+          delete this.input[port][k];
         }
-        delete this.input[port][k];
       }
-    } else {
-
-      this.persist[port] = this.input[port];
-      delete this.input[port];
-
     }
+
   }
-*/
-  //else {
+  else {
 
-  // this also removes context and default..
-  this.clearInput(port);
+    // this also removes context and default..
+    this.clearInput(port);
 
-  debug('%s:%s :freePort event', this.identifier, port);
-  this.event(':freePort', {
-    node: this.export(),
-    link: this._activeConnections[port], // can be undefined, ok
-    port: port
-  });
+    debug('%s:%s :freePort event', this.identifier, port);
+    this.event(':freePort', {
+      node: this.export(),
+      link: this._activeConnections[port], // can be undefined, ok
+      port: port
+    });
 
-  this.emit('freePort', {
-    node: this.export(),
-    link: this._activeConnections[port],
-    port: port
-  });
+    this.emit('freePort', {
+      node: this.export(),
+      link: this._activeConnections[port],
+      port: port
+    });
 
-  // delete reference to active connection (if there was one)
-  // delete this._activeConnections[port];
-  this._activeConnections[port] = null;
-  //}
+    // delete reference to active connection (if there was one)
+    // delete this._activeConnections[port];
+    this._activeConnections[port] = null;
+  }
 
 };
 
@@ -7097,21 +7080,16 @@ xNode.prototype._allConnectedSyncFilled = function() {
     if (!this.ports.input[port].async ||
       !this.ports.input[port].fn) {
 
-      // should be better index check perhaps
-      if (!this.persist.hasOwnProperty(port)) {
-
-        if (this.ports.input[port].indexed) {
-          if (/object/i.test(this.ports.input[port].type)) {
-            return this._objectPortIsFilled(port);
-          }
-          else {
-            return this._arrayPortIsFilled(port);
-          }
+      if (this.ports.input[port].indexed) {
+        if (/object/i.test(this.ports.input[port].type)) {
+          return this._objectPortIsFilled(port);
         }
-        else if (this.input[port] === undefined) {
-          return xNode.SYNC_NOT_FILLED;
+        else {
+          return this._arrayPortIsFilled(port);
         }
-
+      }
+      else if (this.input[port] === undefined) {
+        return xNode.SYNC_NOT_FILLED;
       }
     }
   }
@@ -9395,28 +9373,20 @@ var portFill;
 
 module.exports = portFill = exports;
 
-exports.fill = function(ports, input, context, persist) {
+exports.fill = function(ports, input, context) {
 
   var ret;
 
   for (var port in ports) {
     if (ports.hasOwnProperty(port)) {
-      if (this.portHasConnections(port) &&
-        !persist.hasOwnProperty(port)) {
-        // mainly to not fill async ports with connects
-        // but do have defaults
-        // nop
-      } else {
-        ret = portFill.defaulter(
-          port,
-          ports,
-          input,
-          context,
-          persist
-        );
-        if (util.isError(ret)) {
-          return ret;
-        }
+      ret = portFill.defaulter(
+        port,
+        ports,
+        input,
+        context
+      );
+      if (util.isError(ret)) {
+        return ret;
       }
     }
   }
@@ -9475,41 +9445,28 @@ exports.check = function(obj, key, input, context, persist) {
 
     // check whether input was defined for this port
     if (!input.hasOwnProperty(key)) {
-
-      // This will not really work for persisted indexes
-      // or at least it should check whether the array is full after
-      // this fill
-      if (persist && persist.hasOwnProperty(key)) {
-        console.log('GOT PERSIST!', persist[key]);
-        // ok this does not work, because persist should only be considered.
-        // if it's the last one. which makes the IO manager the only one
-        // who can really decided. you might say it's a property of the
-        // packet.. which I think would be rather stable.
-        // before I did not have a packet, which made it harder.
-        // so this means all persist logic can be removed from node.
-        input[key] = persist[key];
-        return Port.PERSISTED_SET;
-      }
-
       // if there is context, use that.
       if (context && context.hasOwnProperty(key)) {
         input[key] = context[key];
         return Port.CONTEXT_SET;
         // check the existance of default (a value of null is also valid)
       }
-
-      if (obj[key].hasOwnProperty('default')) {
+      else if (persist && persist.hasOwnProperty(key)) {
+        input[key] = persist[key];
+        return Port.PERSISTED_SET;
+      }
+      else if (obj[key].hasOwnProperty('default')) {
         input[key] = obj[key].default;
         return Port.DEFAULT_SET;
       }
-
-      if (obj[key].required === false) {
+      else if (obj[key].required === false) {
         // filled but empty let the node handle it.
         input[key] = null;
         return Port.NOT_REQUIRED;
       }
-
-      return Port.NOT_FILLED;
+      else {
+        return Port.NOT_FILLED;
+      }
 
     }
     else {
@@ -9525,13 +9482,12 @@ exports.check = function(obj, key, input, context, persist) {
  * @param {string} port
  * @private
  */
-exports.defaulter = function(port, ports, input, context, persist) {
+exports.defaulter = function(port, ports, input, context) {
   if (!portFill.check(
       ports,
       port,
       input,
-      context,
-      persist
+      context
     ) && !ports[port].async) {
 
     if (port[0] !== ':') {
@@ -11582,7 +11538,7 @@ function Loader() {
    *    }
    *
    *  }
-   *G
+   *
    * }
    *
    */
@@ -12261,6 +12217,17 @@ exports.load = load;
 exports.useColors = useColors;
 
 /**
+ * Use chrome.storage.local if we are in an app
+ */
+
+var storage;
+
+if (typeof chrome !== 'undefined' && typeof chrome.storage !== 'undefined')
+  storage = chrome.storage.local;
+else
+  storage = window.localStorage;
+
+/**
  * Colors.
  */
 
@@ -12349,10 +12316,10 @@ function formatArgs() {
  */
 
 function log() {
-  // This hackery is required for IE8,
-  // where the `console.log` function doesn't have 'apply'
-  return 'object' == typeof console
-    && 'function' == typeof console.log
+  // this hackery is required for IE8/9, where
+  // the `console.log` function doesn't have 'apply'
+  return 'object' === typeof console
+    && console.log
     && Function.prototype.apply.call(console.log, console, arguments);
 }
 
@@ -12366,9 +12333,9 @@ function log() {
 function save(namespaces) {
   try {
     if (null == namespaces) {
-      localStorage.removeItem('debug');
+      storage.removeItem('debug');
     } else {
-      localStorage.debug = namespaces;
+      storage.debug = namespaces;
     }
   } catch(e) {}
 }
@@ -12383,7 +12350,7 @@ function save(namespaces) {
 function load() {
   var r;
   try {
-    r = localStorage.debug;
+    r = storage.debug;
   } catch(e) {}
   return r;
 }
@@ -14518,229 +14485,7 @@ module.exports={
   }
 }
 
-},{}],54:[function(require,module,exports){
-'use strict';
-
-/**
- *
- * Ok, this should be a general listener interface.
- *
- * One who will use it is the Actor.
- * But I want to be able to do the same for e.g. Loader.
- *
- * They will all be in chix-monitor-*
- *
- * npmlog =  Listener(instance, options);
- *
- * The return is just in case you want to do other stuff.
- *
- * e.g. fbpx wants to add this to npmlog:
- *
- * Logger.level = program.verbose ? 'verbose' : program.debug;
- *
- */
-// function NpmLogActorMonitor(actor, opts) {
-module.exports = function NpmLogActorMonitor(Logger, actor) {
-
-   // TODO: just make an NpmLogIOMonitor.
-   var ioHandler = actor.ioHandler;
-
-   actor.on('removeLink', function(event) {
-     Logger.debug(
-       event.node ? event.node.identifier : 'Some Actor',
-       'removed link'
-     );
-   });
-
-   // Ok emiting each and every output I don't like for the IOHandler.
-   // but whatever can change it later.
-   ioHandler.on('output', function(data) {
-
-     // I don't like this data.out.port thing vs data.port
-     switch(data.port) {
-
-        case ':plug':
-         Logger.debug(
-           data.node.identifier,
-           'port %s plugged (%d)',
-           data.out.read().port,
-           data.out.read().connections);
-        break;
-
-        case ':unplug':
-         Logger.debug(
-           data.node.identifier,
-           'port %s unplugged (%d)',
-           data.out.read().port,
-           data.out.read().connections);
-        break;
-
-        case ':portFill':
-         Logger.info(
-           data.node.identifier,
-           'port %s filled with data',
-           data.out.read().port);
-        break;
-
-        case ':contextUpdate':
-         Logger.info(
-           data.node.identifier,
-           'port %s filled with context',
-           data.out.read().port);
-        break;
-
-        case ':inputValidated':
-          Logger.debug(data.node.identifier, 'input validated');
-        break;
-
-        case ':start':
-          Logger.info(data.node.identifier, 'START');
-        break;
-
-        case ':freePort':
-          Logger.debug(data.node.identifier, 'free port %s', data.out.read().port);
-        break;
-
-/*
-       case ':queue':
-         Logger.debug(
-           data.node,
-           'queue: %s',
-           data.port
-         );
-       break;
-*/
-
-       case ':openPort':
-         Logger.info(
-           data.node.identifier,
-           'opened port %s (%d)',
-           data.out.read().port,
-           data.out.read().connections
-           );
-       break;
-
-       case ':closePort':
-         Logger.info(
-           data.node.identifier,
-           'closed port %s',
-           data.out.read().port
-           );
-       break;
-
-       case ':index':
-         Logger.info(
-           data.node.identifier,
-           '[%s] set on port `%s`',
-           data.out.read().index,
-           data.out.read().port
-           );
-       break;
-
-       case ':nodeComplete':
-         // console.log('nodeComplete', data);
-         Logger.info(data.node.identifier, 'completed');
-       break;
-
-       case ':portReject':
-         Logger.debug(
-           data.node.identifier,
-           'rejected input on port %s',
-           data.out.read().port
-         );
-       break;
-
-       case ':inputRequired':
-         Logger.error(
-           data.node.identifier,
-           'input required on port %s',
-           data.out.read().port);
-       break;
-
-       case ':error':
-         Logger.error(
-           data.node.identifier,
-           data.out.read().msg
-         );
-       break;
-
-       case ':nodeTimeout':
-         Logger.error(
-           data.node.identifier,
-           'node timeout'
-         );
-       break;
-
-       case ':executed':
-         Logger.info(
-           data.node.identifier,
-           'EXECUTED'
-         );
-       break;
-
-       case ':inputTimeout':
-         Logger.info(
-           data.node.identifier,
-           'input timeout, got %s need %s',
-           Object.keys(data.node.input).join(', '),
-           data.node.openPorts.join(', '));
-       break;
-
-       default:
-         // TODO: if the above misses a system port it will be reported
-         //       as default normal output.
-         Logger.info(data.node.identifier, 'output on port %s', data.port);
-       break;
-
-     }
-
-   });
-
-   return Logger;
-
-};
-
-},{}],55:[function(require,module,exports){
-'use strict';
-
-/**
- *
- * NpmLog monitor for the Loader
- *
- */
-module.exports = function NpmLogLoaderMonitor(Logger, loader) {
-
-  loader.on('loadUrl', function(data) {
-    Logger.info( 'loadUrl', data.url);
-  });
-
-  loader.on('loadFile', function(data) {
-    Logger.info( 'loadFile', data.path);
-  });
-
-  loader.on('loadCache', function(data) {
-    Logger.debug( 'cache', 'loaded cache file %s', data.file);
-  });
-
-  loader.on('purgeCache', function(data) {
-    Logger.debug( 'cache', 'purged cache file %s', data.file);
-  });
-
-  loader.on('writeCache', function(data) {
-    Logger.debug( 'cache', 'wrote cache file %s', data.file);
-  });
-
-  return Logger;
-
-};
-
-},{}],"chix-monitor-npmlog":[function(require,module,exports){
-module.exports=require('HNG52E');
-},{}],"HNG52E":[function(require,module,exports){
-exports.Actor = require('./lib/actor');
-exports.Loader = require('./lib/loader');
-
-},{"./lib/actor":54,"./lib/loader":55}],"UsqOEx":[function(require,module,exports){
+},{}],"UsqOEx":[function(require,module,exports){
 
 /**
  * Expose `parse`.
@@ -15116,14 +14861,12 @@ DotObject.prototype.set = function(path, val, obj, merge) {
 
 module.exports = DotObject;
 
-},{}],"json-editor":[function(require,module,exports){
-module.exports=require('pRDjjY');
 },{}],"pRDjjY":[function(require,module,exports){
-/*! JSON Editor v0.7.13 - JSON Schema -> HTML Editor
+/*! JSON Editor v0.7.14 - JSON Schema -> HTML Editor
  * By Jeremy Dorn - https://github.com/jdorn/json-editor/
  * Released under the MIT license
  *
- * Date: 2014-11-11
+ * Date: 2015-01-25
  */
 
 /**
@@ -15141,20 +14884,20 @@ module.exports=require('pRDjjY');
 var Class;
 (function(){
   var initializing = false, fnTest = /xyz/.test(function(){window.postMessage("xyz");}) ? /\b_super\b/ : /.*/;
-
+ 
   // The base Class implementation (does nothing)
   Class = function(){};
-
+ 
   // Create a new Class that inherits from this class
   Class.extend = function(prop) {
     var _super = this.prototype;
-
+   
     // Instantiate a base class (but only create the instance,
     // don't run the init constructor)
     initializing = true;
     var prototype = new this();
     initializing = false;
-
+   
     // Copy the properties over onto the new prototype
     for (var name in prop) {
       // Check if we're overwriting an existing function
@@ -15163,41 +14906,41 @@ var Class;
         (function(name, fn){
           return function() {
             var tmp = this._super;
-
+           
             // Add a new ._super() method that is the same method
             // but on the super-class
             this._super = _super[name];
-
+           
             // The method only need to be bound temporarily, so we
             // remove it when we're done executing
-            var ret = fn.apply(this, arguments);
+            var ret = fn.apply(this, arguments);        
             this._super = tmp;
-
+           
             return ret;
           };
         })(name, prop[name]) :
         prop[name];
     }
-
+   
     // The dummy class constructor
     function Class() {
       // All construction is actually done in the init method
       if ( !initializing && this.init )
         this.init.apply(this, arguments);
     }
-
+   
     // Populate our constructed prototype object
     Class.prototype = prototype;
-
+   
     // Enforce the constructor to be what we expect
     Class.prototype.constructor = Class;
-
+ 
     // And make this class extendable
     Class.extend = arguments.callee;
-
+   
     return Class;
   };
-
+  
   return Class;
 })();
 
@@ -15223,20 +14966,20 @@ var Class;
     var vendors = ['ms', 'moz', 'webkit', 'o'];
     for(var x = 0; x < vendors.length && !window.requestAnimationFrame; ++x) {
         window.requestAnimationFrame = window[vendors[x]+'RequestAnimationFrame'];
-        window.cancelAnimationFrame = window[vendors[x]+'CancelAnimationFrame'] ||
+        window.cancelAnimationFrame = window[vendors[x]+'CancelAnimationFrame'] || 
                                       window[vendors[x]+'CancelRequestAnimationFrame'];
     }
-
+ 
     if (!window.requestAnimationFrame)
         window.requestAnimationFrame = function(callback, element) {
             var currTime = new Date().getTime();
             var timeToCall = Math.max(0, 16 - (currTime - lastTime));
-            var id = window.setTimeout(function() { callback(currTime + timeToCall); },
+            var id = window.setTimeout(function() { callback(currTime + timeToCall); }, 
               timeToCall);
             lastTime = currTime + timeToCall;
             return id;
         };
-
+ 
     if (!window.cancelAnimationFrame)
         window.cancelAnimationFrame = function(id) {
             clearTimeout(id);
@@ -15317,42 +15060,41 @@ var $triggerc = function(el,event) {
   el.dispatchEvent(e);
 };
 
-function JSONEditor(element,options) {
+var JSONEditor = function(element,options) {
   options = $extend({},JSONEditor.defaults.options,options||{});
   this.element = element;
   this.options = options;
   this.init();
-}
-JSONEditor.constructor.name = 'JSONEditor';
+};
 JSONEditor.prototype = {
   init: function() {
     var self = this;
-
+    
     this.ready = false;
 
     var theme_class = JSONEditor.defaults.themes[this.options.theme || JSONEditor.defaults.theme];
     if(!theme_class) throw "Unknown theme " + (this.options.theme || JSONEditor.defaults.theme);
-
+    
     this.schema = this.options.schema;
     this.theme = new theme_class();
     this.template = this.options.template;
     this.refs = this.options.refs || {};
     this.uuid = 0;
     this.__data = {};
-
+    
     var icon_class = JSONEditor.defaults.iconlibs[this.options.iconlib || JSONEditor.defaults.iconlib];
     if(icon_class) this.iconlib = new icon_class();
 
     this.root_container = this.theme.getContainer();
     this.element.appendChild(this.root_container);
-
+    
     this.translate = this.options.translate || JSONEditor.defaults.translate;
 
     // Fetch all external refs via ajax
     this._loadExternalRefs(this.schema, function() {
       self._getDefinitions(self.schema);
       self.validator = new JSONEditor.Validator(self);
-
+      
       // Create the root editor
       var editor_class = self.getEditorClass(self.schema);
       self.root = self.createEditor(editor_class, {
@@ -15361,7 +15103,7 @@ JSONEditor.prototype = {
         required: true,
         container: self.root_container
       });
-
+      
       self.root.preBuild();
       self.root.build();
       self.root.postBuild();
@@ -15396,7 +15138,7 @@ JSONEditor.prototype = {
   },
   validate: function(value) {
     if(!this.ready) throw "JSON Editor not ready yet.  Listen for 'ready' event before validating";
-
+    
     // Custom value
     if(arguments.length === 1) {
       return this.validator.validate(value);
@@ -15409,7 +15151,7 @@ JSONEditor.prototype = {
   destroy: function() {
     if(this.destroyed) return;
     if(!this.ready) return;
-
+    
     this.schema = null;
     this.options = null;
     this.root.destroy();
@@ -15423,14 +15165,14 @@ JSONEditor.prototype = {
     this.__data = null;
     this.ready = false;
     this.element.innerHTML = '';
-
+    
     this.destroyed = true;
   },
   on: function(event, callback) {
     this.callbacks = this.callbacks || {};
     this.callbacks[event] = this.callbacks[event] || [];
     this.callbacks[event].push(callback);
-
+    
     return this;
   },
   off: function(event, callback) {
@@ -15454,7 +15196,7 @@ JSONEditor.prototype = {
     else {
       this.callbacks = {};
     }
-
+    
     return this;
   },
   trigger: function(event) {
@@ -15463,7 +15205,7 @@ JSONEditor.prototype = {
         this.callbacks[event][i]();
       }
     }
-
+    
     return this;
   },
   setOption: function(option, value) {
@@ -15475,7 +15217,7 @@ JSONEditor.prototype = {
     else {
       throw "Option "+option+" must be set during instantiation and cannot be changed later";
     }
-
+    
     return this;
   },
   getEditorClass: function(schema) {
@@ -15504,30 +15246,30 @@ JSONEditor.prototype = {
   },
   onChange: function() {
     if(!this.ready) return;
-
+    
     if(this.firing_change) return;
     this.firing_change = true;
-
+    
     var self = this;
-
+    
     window.requestAnimationFrame(function() {
       self.firing_change = false;
       if(!self.ready) return;
 
       // Validate and cache results
       self.validation_results = self.validator.validate(self.root.getValue());
-
+      
       if(self.options.show_errors !== "never") {
         self.root.showValidationErrors(self.validation_results);
       }
       else {
         self.root.showValidationErrors([]);
       }
-
+      
       // Fire change event
       self.trigger('change');
     });
-
+    
     return this;
   },
   compileTemplate: function(template, name) {
@@ -15570,7 +15312,7 @@ JSONEditor.prototype = {
     else {
       // No data stored
       if(!el.hasAttribute('data-jsoneditor-'+key)) return null;
-
+      
       return this.__data[el.getAttribute('data-jsoneditor-'+key)];
     }
   },
@@ -15592,7 +15334,7 @@ JSONEditor.prototype = {
     this.watchlist = this.watchlist || {};
     this.watchlist[path] = this.watchlist[path] || [];
     this.watchlist[path].push(callback);
-
+    
     return this;
   },
   unwatch: function(path,callback) {
@@ -15602,7 +15344,7 @@ JSONEditor.prototype = {
       this.watchlist[path] = null;
       return this;
     }
-
+    
     var newlist = [];
     for(var i=0; i<this.watchlist[path].length; i++) {
       if(this.watchlist[path][i] === callback) continue;
@@ -15647,11 +15389,11 @@ JSONEditor.prototype = {
         }
       }
     };
-
+    
     if(schema.$ref && schema.$ref.substr(0,1) !== "#" && !this.refs[schema.$ref]) {
       refs[schema.$ref] = true;
     }
-
+    
     for(var i in schema) {
       if(!schema.hasOwnProperty(i)) continue;
       if(schema[i] && typeof schema[i] === "object" && Array.isArray(schema[i])) {
@@ -15665,25 +15407,25 @@ JSONEditor.prototype = {
         merge_refs(this._getExternalRefs(schema[i]));
       }
     }
-
+    
     return refs;
   },
   _loadExternalRefs: function(schema, callback) {
     var self = this;
     var refs = this._getExternalRefs(schema);
-
+    
     var done = 0, waiting = 0, callback_fired = false;
-
+    
     $each(refs,function(url) {
       if(self.refs[url]) return;
       if(!self.options.ajax) throw "Must set ajax option to true to load external ref "+url;
       self.refs[url] = 'loading';
       waiting++;
 
-      var r = new XMLHttpRequest();
+      var r = new XMLHttpRequest(); 
       r.open("GET", url, true);
       r.onreadystatechange = function () {
-        if (r.readyState != 4) return;
+        if (r.readyState != 4) return; 
         // Request succeeded
         if(r.status === 200) {
           var response;
@@ -15695,7 +15437,7 @@ JSONEditor.prototype = {
             throw "Failed to parse external ref "+url;
           }
           if(!response || typeof response !== "object") throw "External ref does not contain a valid schema - "+url;
-
+          
           self.refs[url] = response;
           self._loadExternalRefs(response,function() {
             done++;
@@ -15713,14 +15455,14 @@ JSONEditor.prototype = {
       };
       r.send();
     });
-
+    
     if(!waiting) {
       callback();
     }
   },
   expandRefs: function(schema) {
     schema = $extend({},schema);
-
+    
     while (schema.$ref) {
       var ref = schema.$ref;
       delete schema.$ref;
@@ -15783,7 +15525,7 @@ JSONEditor.prototype = {
     if(schema.not) {
       schema.not = this.expandSchema(schema.not);
     }
-
+    
     // allOf schemas should be merged into the parent
     if(schema.allOf) {
       for(i=0; i<schema.allOf.length; i++) {
@@ -15813,7 +15555,7 @@ JSONEditor.prototype = {
         extended.oneOf[i] = this.extendSchemas(this.expandSchema(schema.oneOf[i]),tmp);
       }
     }
-
+    
     return this.expandRefs(extended);
   },
   extendSchemas: function(obj1, obj2) {
@@ -16160,7 +15902,7 @@ JSONEditor.Validator = Class.extend({
 
       // `minLength`
       if(schema.minLength) {
-        if((value+"").length < schema.minLength) {
+        if((value+"").length < schema.minLength) {          
           errors.push({
             path: path,
             property: 'minLength',
@@ -16457,25 +16199,25 @@ JSONEditor.AbstractEditor = Class.extend({
   },
   init: function(options) {
     this.jsoneditor = options.jsoneditor;
-
+    
     this.theme = this.jsoneditor.theme;
     this.template_engine = this.jsoneditor.template;
     this.iconlib = this.jsoneditor.iconlib;
-
+    
     this.original_schema = options.schema;
     this.schema = this.jsoneditor.expandSchema(this.original_schema);
-
+    
     this.options = $extend({}, (this.options || {}), (options.schema.options || {}), options);
-
+    
     if(!options.path && !this.schema.id) this.schema.id = 'root';
     this.path = options.path || 'root';
     this.formname = options.formname || this.path.replace(/\.([^.]+)/g,'[$1]');
     if(this.jsoneditor.options.form_name_root) this.formname = this.formname.replace(/^root\[/,this.jsoneditor.options.form_name_root+'[');
     this.key = this.path.split('.').pop();
     this.parent = options.parent;
-
+    
     this.link_watchers = [];
-
+    
     if(options.container) this.setContainer(options.container);
   },
   setContainer: function(container) {
@@ -16484,12 +16226,12 @@ JSONEditor.AbstractEditor = Class.extend({
     if(this.schema.type && typeof this.schema.type === "string") this.container.setAttribute('data-schematype',this.schema.type);
     this.container.setAttribute('data-schemapath',this.path);
   },
-
+  
   preBuild: function() {
 
   },
   build: function() {
-
+    
   },
   postBuild: function() {
     this.setupWatchListeners();
@@ -16499,10 +16241,10 @@ JSONEditor.AbstractEditor = Class.extend({
     this.register();
     this.onWatchedFieldChange();
   },
-
+  
   setupWatchListeners: function() {
     var self = this;
-
+    
     // Watched fields
     this.watched = {};
     if(this.schema.vars) this.schema.watch = this.schema.vars;
@@ -16512,7 +16254,7 @@ JSONEditor.AbstractEditor = Class.extend({
         self.onWatchedFieldChange();
       }
     };
-
+    
     this.register();
     if(this.schema.hasOwnProperty('watch')) {
       var path,path_parts,first,root,adjusted_path;
@@ -16538,19 +16280,19 @@ JSONEditor.AbstractEditor = Class.extend({
 
         // Keep track of the root node and path for use when rendering the template
         adjusted_path = root.getAttribute('data-schemapath') + '.' + path_parts.join('.');
-
+        
         self.jsoneditor.watch(adjusted_path,self.watch_listener);
-
+        
         self.watched[name] = adjusted_path;
       }
     }
-
+    
     // Dynamic header
     if(this.schema.headerTemplate) {
       this.header_template = this.jsoneditor.compileTemplate(this.schema.headerTemplate, this.template_engine);
     }
   },
-
+  
   addLinks: function() {
     // Add links
     if(!this.no_link_holder) {
@@ -16563,18 +16305,18 @@ JSONEditor.AbstractEditor = Class.extend({
       }
     }
   },
-
-
+  
+  
   getButton: function(text, icon, title) {
     var btnClass = 'json-editor-btn-'+icon;
     if(!this.iconlib) icon = null;
     else icon = this.iconlib.getIcon(icon);
-
+    
     if(!icon && title) {
       text = title;
       title = null;
     }
-
+    
     var btn = this.theme.getButton(text, icon, title);
     btn.className += ' ' + btnClass + ' ';
     return btn;
@@ -16582,12 +16324,12 @@ JSONEditor.AbstractEditor = Class.extend({
   setButtonText: function(button, text, icon, title) {
     if(!this.iconlib) icon = null;
     else icon = this.iconlib.getIcon(icon);
-
+    
     if(!icon && title) {
       text = title;
       title = null;
     }
-
+    
     return this.theme.setButtonText(button, text, icon, title);
   },
   addLink: function(link) {
@@ -16595,24 +16337,24 @@ JSONEditor.AbstractEditor = Class.extend({
   },
   getLink: function(data) {
     var holder, link;
-
+        
     // Get mime type of the link
     var mime = data.mediaType || 'application/javascript';
     var type = mime.split('/')[0];
-
+    
     // Template to generate the link href
     var href = this.jsoneditor.compileTemplate(data.href,this.template_engine);
-
+    
     // Image links
     if(type === 'image') {
       holder = this.theme.getBlockLinkHolder();
       link = document.createElement('a');
       link.setAttribute('target','_blank');
       var image = document.createElement('img');
-
+      
       this.theme.createImageLink(holder,link,image);
-
-      // When a watched field changes, update the url
+    
+      // When a watched field changes, update the url  
       this.link_watchers.push(function(vars) {
         var url = href(vars);
         link.setAttribute('href',url);
@@ -16623,16 +16365,16 @@ JSONEditor.AbstractEditor = Class.extend({
     // Audio/Video links
     else if(['audio','video'].indexOf(type) >=0) {
       holder = this.theme.getBlockLinkHolder();
-
+      
       link = this.theme.getBlockLink();
       link.setAttribute('target','_blank');
-
+      
       var media = document.createElement(type);
       media.setAttribute('controls','controls');
-
+      
       this.theme.createMediaLink(holder,link,media);
-
-      // When a watched field changes, update the url
+      
+      // When a watched field changes, update the url  
       this.link_watchers.push(function(vars) {
         var url = href(vars);
         link.setAttribute('href',url);
@@ -16645,15 +16387,15 @@ JSONEditor.AbstractEditor = Class.extend({
       holder = this.theme.getBlockLink();
       holder.setAttribute('target','_blank');
       holder.textContent = data.rel;
-
-      // When a watched field changes, update the url
+      
+      // When a watched field changes, update the url  
       this.link_watchers.push(function(vars) {
         var url = href(vars);
         holder.setAttribute('href',url);
         holder.textContent = data.rel || url;
       });
     }
-
+    
     return holder;
   },
   refreshWatchedFieldValues: function() {
@@ -16661,7 +16403,7 @@ JSONEditor.AbstractEditor = Class.extend({
     var watched = {};
     var changed = false;
     var self = this;
-
+    
     if(this.watched) {
       var val,editor;
       for(var name in this.watched) {
@@ -16672,12 +16414,12 @@ JSONEditor.AbstractEditor = Class.extend({
         watched[name] = val;
       }
     }
-
+    
     watched.self = this.getValue();
     if(this.watched_values.self !== watched.self) changed = true;
-
+    
     this.watched_values = watched;
-
+    
     return changed;
   },
   getWatchedFieldValues: function() {
@@ -16695,7 +16437,7 @@ JSONEditor.AbstractEditor = Class.extend({
   },
   onWatchedFieldChange: function() {
     var vars;
-    if(this.header_template) {
+    if(this.header_template) {      
       vars = $extend(this.getWatchedFieldValues(),{
         key: this.key,
         i: this.key,
@@ -16704,7 +16446,7 @@ JSONEditor.AbstractEditor = Class.extend({
         title: this.getTitle()
       });
       var header_text = this.header_template(vars);
-
+      
       if(header_text !== this.header_text) {
         this.header_text = header_text;
         this.updateHeaderText();
@@ -16754,12 +16496,12 @@ JSONEditor.AbstractEditor = Class.extend({
   getDefault: function() {
     if(this.schema.default) return this.schema.default;
     if(this.schema.enum) return this.schema.enum[0];
-
+    
     var type = this.schema.type || this.schema.oneOf;
     if(type && Array.isArray(type)) type = type[0];
     if(type && typeof type === "object") type = type.type;
     if(type && Array.isArray(type)) type = type[0];
-
+    
     if(typeof type === "string") {
       if(type === "number") return 0.0;
       if(type === "boolean") return false;
@@ -16768,7 +16510,7 @@ JSONEditor.AbstractEditor = Class.extend({
       if(type === "object") return {};
       if(type === "array") return [];
     }
-
+    
     return null;
   },
   getTitle: function() {
@@ -16786,7 +16528,7 @@ JSONEditor.AbstractEditor = Class.extend({
   getDisplayText: function(arr) {
     var disp = [];
     var used = {};
-
+    
     // Determine how many times each attribute name is used.
     // This helps us pick the most distinct display text for the schemas.
     $each(arr,function(i,el) {
@@ -16807,11 +16549,11 @@ JSONEditor.AbstractEditor = Class.extend({
         used[el.type]++;
       }
     });
-
+    
     // Determine display text for each element of the array
     $each(arr,function(i,el)  {
       var name;
-
+      
       // If it's a simple string
       if(typeof el === "string") name = el;
       // Object
@@ -16825,19 +16567,19 @@ JSONEditor.AbstractEditor = Class.extend({
       else if(el.description) name = el.description;
       else if(JSON.stringify(el).length < 50) name = JSON.stringify(el);
       else name = "type";
-
+      
       disp.push(name);
     });
-
+    
     // Replace identical display text with "text 1", "text 2", etc.
     var inc = {};
     $each(disp,function(i,name) {
       inc[name] = inc[name] || 0;
       inc[name]++;
-
+      
       if(used[name] > 1) disp[i] = name + " " + inc[name];
     });
-
+    
     return disp;
   },
   getOption: function(key) {
@@ -16847,7 +16589,7 @@ JSONEditor.AbstractEditor = Class.extend({
     catch(e) {
       window.console.error(e);
     }
-
+    
     return this.options[key];
   },
   showValidationErrors: function(errors) {
@@ -16880,15 +16622,15 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
   },
   setValue: function(value,initial,from_template) {
     var self = this;
-
+    
     if(this.template && !from_template) {
       return;
     }
-
+    
     if(value === null) value = "";
     else if(typeof value === "object") value = JSON.stringify(value);
     else if(typeof value !== "string") value = ""+value;
-
+    
     if(value === this.serialized) return;
 
     // Sanitize value before setting it
@@ -16899,7 +16641,7 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
     }
 
     this.input.value = sanitized;
-
+    
     // If using SCEditor, update the WYSIWYG
     if(this.sceditor_instance) {
       this.sceditor_instance.val(sanitized);
@@ -16910,13 +16652,15 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
     else if(this.ace_editor) {
       this.ace_editor.setValue(sanitized);
     }
-
+    
     var changed = from_template || this.getValue() !== value;
-
+    
     this.refreshValue();
-
+    
     if(initial) this.is_dirty = false;
     else if(this.jsoneditor.options.show_errors === "change") this.is_dirty = true;
+    
+    if(this.adjust_height) this.adjust_height(this.input);
 
     // Bubble this setValue to parents if the value changed
     this.onChange(changed);
@@ -16924,11 +16668,11 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
   getNumColumns: function() {
     var min = Math.ceil(Math.max(this.getTitle().length,this.schema.maxLength||0,this.schema.minLength||0)/5);
     var num;
-
+    
     if(this.input_type === 'textarea') num = 6;
     else if(['text','email'].indexOf(this.input_type) >= 0) num = 4;
     else num = 2;
-
+    
     return Math.min(12,Math.max(min,num));
   },
   build: function() {
@@ -17023,7 +16767,7 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
       ) {
         this.input_type = this.format;
         this.source_code = true;
-
+        
         this.input = this.theme.getTextareaInput();
       }
       // HTML5 Input type
@@ -17037,13 +16781,18 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
       this.input_type = 'text';
       this.input = this.theme.getFormInputField(this.input_type);
     }
-
+    
     // minLength, maxLength, and pattern
     if(typeof this.schema.maxLength !== "undefined") this.input.setAttribute('maxlength',this.schema.maxLength);
     if(typeof this.schema.pattern !== "undefined") this.input.setAttribute('pattern',this.schema.pattern);
     else if(typeof this.schema.minLength !== "undefined") this.input.setAttribute('pattern','.{'+this.schema.minLength+',}');
 
-    if(this.options.compact) this.container.setAttribute('class',this.container.getAttribute('class')+' compact');
+    if(this.options.compact) {
+      this.container.className += ' compact';
+    }
+    else {
+      if(this.options.input_width) this.input.style.width = this.options.input_width;
+    }
 
     if(this.schema.readOnly || this.schema.readonly || this.schema.template) {
       this.always_disabled = true;
@@ -17051,10 +16800,10 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
     }
 
     this.input
-      .addEventListener('change',function(e) {
+      .addEventListener('change',function(e) {        
         e.preventDefault();
         e.stopPropagation();
-
+        
         // Don't allow changing if this field is a template
         if(self.schema.template) {
           this.value = self.value;
@@ -17062,18 +16811,54 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
         }
 
         var val = this.value;
-
+        
         // sanitize value
         var sanitized = self.sanitize(val);
         if(val !== sanitized) {
           this.value = sanitized;
         }
-
+        
         self.is_dirty = true;
 
         self.refreshValue();
         self.onChange(true);
       });
+      
+    if(this.options.input_height) this.input.style.height = this.options.input_height;
+    if(this.options.expand_height) {
+      this.adjust_height = function(el) {
+        if(!el) return;
+        var i, ch=el.offsetHeight;
+        // Input too short
+        if(el.offsetHeight < el.scrollHeight) {
+          i=0;
+          while(el.offsetHeight < el.scrollHeight+3) {
+            if(i>100) break;
+            i++;
+            ch++;
+            el.style.height = ch+'px';
+          }
+        }
+        else {
+          i=0;
+          while(el.offsetHeight >= el.scrollHeight+3) {
+            if(i>100) break;
+            i++;
+            ch--;
+            el.style.height = ch+'px';
+          }
+          el.style.height = (ch+1)+'px';
+        }
+      };
+      
+      this.input.addEventListener('keyup',function(e) {
+        self.adjust_height(this);
+      });
+      this.input.addEventListener('change',function(e) {
+        self.adjust_height(this);
+      });
+      this.adjust_height();
+    }
 
     if(this.format) this.input.setAttribute('data-schemaformat',this.format);
 
@@ -17086,6 +16871,7 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
       // otherwise, in the case of an ace_editor creation,
       // it will generate an error trying to append it to the missing parentNode
       if(self.input.parentNode) self.afterInputReady();
+      if(self.adjust_height) self.adjust_height(self.input);
     });
 
     // Compile and store the template
@@ -17111,12 +16897,12 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
   },
   afterInputReady: function() {
     var self = this, options;
-
+    
     // Code editor
-    if(this.source_code) {
+    if(this.source_code) {      
       // WYSIWYG html and bbcode editor
-      if(this.options.wysiwyg &&
-        ['html','bbcode'].indexOf(this.input_type) >= 0 &&
+      if(this.options.wysiwyg && 
+        ['html','bbcode'].indexOf(this.input_type) >= 0 && 
         window.jQuery && window.jQuery.fn && window.jQuery.fn.sceditor
       ) {
         options = $extend({},{
@@ -17125,11 +16911,11 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
           width: '100%',
           height: 300
         },JSONEditor.plugins.sceditor,self.options.sceditor_options||{});
-
+        
         window.jQuery(self.input).sceditor(options);
-
+        
         self.sceditor_instance = window.jQuery(self.input).sceditor('instance');
-
+        
         self.sceditor_instance.blur(function() {
           // Get editor's value
           var val = window.jQuery("<div>"+self.sceditor_instance.val()+"</div>");
@@ -17147,16 +16933,16 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
         this.epiceditor_container = document.createElement('div');
         this.input.parentNode.insertBefore(this.epiceditor_container,this.input);
         this.input.style.display = 'none';
-
+        
         options = $extend({},JSONEditor.plugins.epiceditor,{
           container: this.epiceditor_container,
           clientSideStorage: false
         });
-
+        
         this.epiceditor = new window.EpicEditor(options).load();
-
+        
         this.epiceditor.importFile(null,this.getValue());
-
+      
         this.epiceditor.on('update',function() {
           var val = self.epiceditor.exportFile();
           self.input.value = val;
@@ -17172,7 +16958,7 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
         if(mode === 'cpp' || mode === 'c++' || mode === 'c') {
           mode = 'c_cpp';
         }
-
+        
         this.ace_container = document.createElement('div');
         this.ace_container.style.width = '100%';
         this.ace_container.style.position = 'relative';
@@ -17180,15 +16966,15 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
         this.input.parentNode.insertBefore(this.ace_container,this.input);
         this.input.style.display = 'none';
         this.ace_editor = window.ace.edit(this.ace_container);
-
+        
         this.ace_editor.setValue(this.getValue());
-
+        
         // The theme
         if(JSONEditor.plugins.ace.theme) this.ace_editor.setTheme('ace/theme/'+JSONEditor.plugins.ace.theme);
         // The mode
         mode = window.ace.require("ace/mode/"+mode);
         if(mode) this.ace_editor.getSession().setMode(new mode.Mode());
-
+        
         // Listen for changes
         this.ace_editor.on('change',function() {
           var val = self.ace_editor.getValue();
@@ -17199,7 +16985,7 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
         });
       }
     }
-
+    
     self.theme.afterInputReady(self.input);
   },
   refreshValue: function() {
@@ -17218,8 +17004,8 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
     else if(this.ace_editor) {
       this.ace_editor.destroy();
     }
-
-
+    
+    
     this.template = null;
     if(this.input && this.input.parentNode) this.input.parentNode.removeChild(this.input);
     if(this.label && this.label.parentNode) this.label.parentNode.removeChild(this.label);
@@ -17236,23 +17022,23 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
   /**
    * Re-calculates the value if needed
    */
-  onWatchedFieldChange: function() {
+  onWatchedFieldChange: function() {    
     var self = this, vars, j;
-
+    
     // If this editor needs to be rendered by a macro template
     if(this.template) {
       vars = this.getWatchedFieldValues();
       this.setValue(this.template(vars),false,true);
     }
-
+    
     this._super();
   },
   showValidationErrors: function(errors) {
     var self = this;
-
+    
     if(this.jsoneditor.options.show_errors === "always") {}
     else if(!this.is_dirty && this.previous_error_setting===this.jsoneditor.options.show_errors) return;
-
+    
     this.previous_error_setting = this.jsoneditor.options.show_errors;
 
     var messages = [];
@@ -17324,7 +17110,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   enable: function() {
     if(this.editjson_button) this.editjson_button.disabled = false;
     if(this.addproperty_button) this.addproperty_button.disabled = false;
-
+    
     this._super();
     if(this.editors) {
       for(var i in this.editors) {
@@ -17337,7 +17123,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
     if(this.editjson_button) this.editjson_button.disabled = true;
     if(this.addproperty_button) this.addproperty_button.disabled = true;
     this.hideEditJSON();
-
+    
     this._super();
     if(this.editors) {
       for(var i in this.editors) {
@@ -17348,7 +17134,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   },
   layoutEditors: function() {
     var self = this, i, j;
-
+    
     if(!this.row_container) return;
 
     // Sort editors by propertyOrder
@@ -17361,16 +17147,16 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
 
       return ordera - orderb;
     });
-
+    
     var container;
-
+    
     if(this.format === 'grid') {
       var rows = [];
       $each(this.property_order, function(j,key) {
         var editor = self.editors[key];
         if(editor.property_removed) return;
         var found = false;
-        var width = editor.options.hidden? 0 : editor.getNumColumns();
+        var width = editor.options.hidden? 0 : (editor.options.grid_columns || editor.getNumColumns());
         var height = editor.options.hidden? 0 : editor.container.offsetHeight;
         // See if the editor will fit in any of the existing rows first
         for(var i=0; i<rows.length; i++) {
@@ -17383,7 +17169,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
             }
           }
         }
-
+        
         // If there isn't a spot in any of the existing rows, start a new row
         if(found === false) {
           rows.push({
@@ -17394,7 +17180,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
           });
           found = rows.length-1;
         }
-
+        
         rows[found].editors.push({
           key: key,
           //editor: editor,
@@ -17405,7 +17191,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         rows[found].minh = Math.min(rows[found].minh,height);
         rows[found].maxh = Math.max(rows[found].maxh,height);
       });
-
+      
       // Make almost full rows width 12
       // Do this by increasing all editors' sizes proprotionately
       // Any left over space goes to the biggest editor
@@ -17425,11 +17211,11 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
           rows[i].width = 12;
         }
       }
-
+      
       // layout hasn't changed
       if(this.layout === JSON.stringify(rows)) return false;
       this.layout = JSON.stringify(rows);
-
+      
       // Layout the form
       container = document.createElement('div');
       for(i=0; i<rows.length; i++) {
@@ -17438,7 +17224,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         for(j=0; j<rows[i].editors.length; j++) {
           var key = rows[i].editors[j].key;
           var editor = this.editors[key];
-
+          
           if(editor.options.hidden) editor.container.style.display = 'none';
           else this.theme.setGridColumnSize(editor.container,rows[i].editors[j].width);
           editor.container.className += ' container-' + key;
@@ -17454,7 +17240,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         if(editor.property_removed) return;
         var row = self.theme.getGridRow();
         container.appendChild(row);
-
+        
         if(editor.options.hidden) editor.container.style.display = 'none';
         else self.theme.setGridColumnSize(editor.container,12);
         editor.container.className += ' container-' + key;
@@ -17468,7 +17254,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
     // Schema declared directly in properties
     var schema = this.schema.properties[key] || {};
     schema = $extend({},schema);
-
+    
     // Any matching patternProperties should be merged in
     if(this.schema.patternProperties) {
       for(var i in this.schema.patternProperties) {
@@ -17480,7 +17266,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         }
       }
     }
-
+    
     return schema;
   },
   preBuild: function() {
@@ -17511,7 +17297,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         });
         self.editors[key].preBuild();
 
-        var width = self.editors[key].options.hidden? 0 : self.editors[key].getNumColumns();
+        var width = self.editors[key].options.hidden? 0 : (self.editors[key].options.grid_columns || self.editors[key].getNumColumns());
 
         self.minwidth += width;
         self.maxwidth += width;
@@ -17534,12 +17320,12 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         self.addObjectProperty(key, true);
 
         if(self.editors[key]) {
-          self.minwidth = Math.max(self.minwidth,self.editors[key].getNumColumns());
-          self.maxwidth += self.editors[key].getNumColumns();
+          self.minwidth = Math.max(self.minwidth,(self.editors[key].options.grid_columns || self.editors[key].getNumColumns()));
+          self.maxwidth += (self.editors[key].options.grid_columns || self.editors[key].getNumColumns());
         }
       });
     }
-
+    
     // Sort editors by propertyOrder
     this.property_order = Object.keys(this.editors);
     this.property_order = this.property_order.sort(function(a,b) {
@@ -17568,6 +17354,9 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         if(self.editors[key].options.hidden) {
           holder.style.display = 'none';
         }
+        if(self.editors[key].options.input_width) {
+          holder.style.width = self.editors[key].options.input_width;
+        }
       });
     }
     // If the object should be rendered as a table
@@ -17582,7 +17371,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       this.title = this.theme.getHeader(this.header);
       this.container.appendChild(this.title);
       this.container.style.position = 'relative';
-
+      
       // Edit JSON modal
       this.editjson_holder = this.theme.getModal();
       this.editjson_textarea = this.theme.getTextareaInput();
@@ -17604,7 +17393,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       this.editjson_holder.appendChild(this.editjson_textarea);
       this.editjson_holder.appendChild(this.editjson_save);
       this.editjson_holder.appendChild(this.editjson_cancel);
-
+      
       // Manage Properties modal
       this.addproperty_holder = this.theme.getModal();
       this.addproperty_list = document.createElement('div');
@@ -17628,7 +17417,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
             window.alert('there is already a property with that name');
             return;
           }
-
+          
           self.addObjectProperty(self.addproperty_input.value);
           if(self.editors[self.addproperty_input.value]) {
             self.editors[self.addproperty_input.value].disable();
@@ -17642,18 +17431,18 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       var spacer = document.createElement('div');
       spacer.style.clear = 'both';
       this.addproperty_holder.appendChild(spacer);
-
-
+      
+      
       // Description
       if(this.schema.description) {
         this.description = this.theme.getDescription(this.schema.description);
         this.container.appendChild(this.description);
       }
-
+      
       // Validation error placeholder area
       this.error_holder = document.createElement('div');
       this.container.appendChild(this.error_holder);
-
+      
       // Container for child editor area
       this.editor_holder = this.theme.getIndentedPanel();
       this.editor_holder.style.paddingBottom = '0';
@@ -17703,7 +17492,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       if(this.options.collapsed) {
         $trigger(this.toggle_button,'click');
       }
-
+      
       // Collapse button disabled
       if(this.schema.options && typeof this.schema.options.disable_collapse !== "undefined") {
         if(this.schema.options.disable_collapse) this.toggle_button.style.display = 'none';
@@ -17711,7 +17500,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       else if(this.jsoneditor.options.disable_collapse) {
         this.toggle_button.style.display = 'none';
       }
-
+      
       // Edit JSON Button
       this.editjson_button = this.getButton('JSON','edit','Edit JSON');
       this.editjson_button.addEventListener('click',function(e) {
@@ -17721,7 +17510,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       });
       this.editjson_controls.appendChild(this.editjson_button);
       this.editjson_controls.appendChild(this.editjson_holder);
-
+      
       // Edit JSON Buttton disabled
       if(this.schema.options && typeof this.schema.options.disable_edit_json !== "undefined") {
         if(this.schema.options.disable_edit_json) this.editjson_button.style.display = 'none';
@@ -17729,7 +17518,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       else if(this.jsoneditor.options.disable_edit_json) {
         this.editjson_button.style.display = 'none';
       }
-
+      
       // Object Properties Button
       this.addproperty_button = this.getButton('Properties','edit','Object Properties');
       this.addproperty_button.addEventListener('click',function(e) {
@@ -17741,7 +17530,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       this.addproperty_controls.appendChild(this.addproperty_holder);
       this.refreshAddProperties();
     }
-
+    
     // Fix table cell ordering
     if(this.options.table_row) {
       this.editor_holder = this.container;
@@ -17760,18 +17549,18 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   showEditJSON: function() {
     if(!this.editjson_holder) return;
     this.hideAddProperty();
-
+    
     // Position the form directly beneath the button
     // TODO: edge detection
     this.editjson_holder.style.left = this.editjson_button.offsetLeft+"px";
     this.editjson_holder.style.top = this.editjson_button.offsetTop + this.editjson_button.offsetHeight+"px";
-
+    
     // Start the textarea with the current value
     this.editjson_textarea.value = JSON.stringify(this.getValue(),null,2);
-
+    
     // Disable the rest of the form while editing JSON
     this.disable();
-
+    
     this.editjson_holder.style.display = '';
     this.editjson_button.disabled = false;
     this.editing_json = true;
@@ -17779,14 +17568,14 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   hideEditJSON: function() {
     if(!this.editjson_holder) return;
     if(!this.editing_json) return;
-
+    
     this.editjson_holder.style.display = 'none';
     this.enable();
     this.editing_json = false;
   },
   saveJSON: function() {
     if(!this.editjson_holder) return;
-
+    
     try {
       var json = JSON.parse(this.editjson_textarea.value);
       this.setValue(json);
@@ -17846,21 +17635,21 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       self.onChange(true);
     });
     self.addproperty_checkboxes[key] = checkbox;
-
+    
     return checkbox;
   },
   showAddProperty: function() {
     if(!this.addproperty_holder) return;
     this.hideEditJSON();
-
+    
     // Position the form directly beneath the button
     // TODO: edge detection
     this.addproperty_holder.style.left = this.addproperty_button.offsetLeft+"px";
     this.addproperty_holder.style.top = this.addproperty_button.offsetTop + this.addproperty_button.offsetHeight+"px";
-
+    
     // Disable the rest of the form while editing JSON
     this.disable();
-
+    
     this.adding_property = true;
     this.addproperty_button.disabled = false;
     this.addproperty_holder.style.display = '';
@@ -17869,10 +17658,10 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   hideAddProperty: function() {
     if(!this.addproperty_holder) return;
     if(!this.adding_property) return;
-
+    
     this.addproperty_holder.style.display = 'none';
     this.enable();
-
+    
     this.adding_property = false;
   },
   toggleAddProperty: function() {
@@ -17883,17 +17672,17 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
     if(this.editors[property]) {
       this.editors[property].unregister();
       delete this.editors[property];
-
+      
       this.refreshValue();
       this.layoutEditors();
     }
   },
   addObjectProperty: function(name, prebuild_only) {
     var self = this;
-
+    
     // Property is already added
     if(this.editors[name]) return;
-
+    
     // Property was added before and is cached
     if(this.cached_editors[name]) {
       this.editors[name] = this.cached_editors[name];
@@ -17907,8 +17696,8 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       }
 
       var schema = self.getPropertySchema(name);
-
-
+      
+            
       // Add the property
       var editor = self.jsoneditor.getEditorClass(schema);
 
@@ -17919,7 +17708,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         parent: self
       });
       self.editors[name].preBuild();
-
+      
       if(!prebuild_only) {
         var holder = self.theme.getChildEditorHolder();
         self.editor_holder.appendChild(holder);
@@ -17927,10 +17716,10 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         self.editors[name].build();
         self.editors[name].postBuild();
       }
-
+      
       self.cached_editors[name] = self.editors[name];
     }
-
+    
     // If we're only prebuilding the editors, don't refresh values
     if(!prebuild_only) {
       self.refreshValue();
@@ -17973,12 +17762,12 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   refreshValue: function() {
     this.value = {};
     var self = this;
-
+    
     for(var i in this.editors) {
       if(!this.editors.hasOwnProperty(i)) continue;
       this.value[i] = this.editors[i].getValue();
     }
-
+    
     if(this.adding_property) this.refreshAddProperties();
   },
   refreshAddProperties: function() {
@@ -17988,31 +17777,31 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
     }
 
     var can_add = false, can_remove = false, num_props = 0, i, show_modal = false;
-
+    
     // Get number of editors
     for(i in this.editors) {
       if(!this.editors.hasOwnProperty(i)) continue;
       num_props++;
     }
-
+    
     // Determine if we can add back removed properties
     can_add = this.canHaveAdditionalProperties() && !(typeof this.schema.maxProperties !== "undefined" && num_props >= this.schema.maxProperties);
-
+    
     if(this.addproperty_checkboxes) {
       this.addproperty_list.innerHTML = '';
     }
     this.addproperty_checkboxes = {};
-
+    
     // Check for which editors can't be removed or added back
     for(i in this.cached_editors) {
       if(!this.cached_editors.hasOwnProperty(i)) continue;
-
+      
       this.addPropertyCheckbox(i);
-
+      
       if(this.isRequired(this.cached_editors[i]) && i in this.editors) {
         this.addproperty_checkboxes[i].disabled = true;
       }
-
+      
       if(typeof this.schema.minProperties !== "undefined" && num_props <= this.schema.minProperties) {
         this.addproperty_checkboxes[i].disabled = this.addproperty_checkboxes[i].checked;
         if(!this.addproperty_checkboxes[i].checked) show_modal = true;
@@ -18031,11 +17820,11 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         can_remove = true;
       }
     }
-
+    
     if(this.canHaveAdditionalProperties()) {
       show_modal = true;
     }
-
+    
     // Additional addproperty checkboxes not tied to a current editor
     for(i in this.schema.properties) {
       if(!this.schema.properties.hasOwnProperty(i)) continue;
@@ -18043,7 +17832,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
       show_modal = true;
       this.addPropertyCheckbox(i);
     }
-
+    
     // If no editors can be added or removed, hide the modal button
     if(!show_modal) {
       this.hideAddProperty();
@@ -18072,7 +17861,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
   setValue: function(value, initial) {
     var self = this;
     value = value || {};
-
+    
     if(typeof value !== "object" || Array.isArray(value)) value = {};
 
     // First, set the values for all of the defined properties
@@ -18083,9 +17872,9 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         editor.setValue(value[i],initial);
       }
       // Otherwise, remove value unless this is the initial set or it's required
-      // else if(!initial && !self.isRequired(editor)) {
-      //  self.removeObjectProperty(i);
-      //}
+      else if(!initial && !self.isRequired(editor)) {
+        self.removeObjectProperty(i);
+      }
       // Otherwise, set the value to the default
       else {
         editor.setValue(editor.getDefault(),initial);
@@ -18098,7 +17887,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         if(self.editors[i]) self.editors[i].setValue(val,initial);
       }
     });
-
+    
     this.refreshValue();
     this.layoutEditors();
     this.onChange();
@@ -18185,11 +17974,11 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     if(this.add_row_button) this.add_row_button.disabled = false;
     if(this.remove_all_rows_button) this.remove_all_rows_button.disabled = false;
     if(this.delete_last_row_button) this.delete_last_row_button.disabled = false;
-
+    
     if(this.rows) {
       for(var i=0; i<this.rows.length; i++) {
         this.rows[i].enable();
-
+        
         if(this.rows[i].moveup_button) this.rows[i].moveup_button.disabled = false;
         if(this.rows[i].movedown_button) this.rows[i].movedown_button.disabled = false;
         if(this.rows[i].delete_button) this.rows[i].delete_button.disabled = false;
@@ -18205,7 +17994,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     if(this.rows) {
       for(var i=0; i<this.rows.length; i++) {
         this.rows[i].disable();
-
+        
         if(this.rows[i].moveup_button) this.rows[i].moveup_button.disabled = true;
         if(this.rows[i].movedown_button) this.rows[i].movedown_button.disabled = true;
         if(this.rows[i].delete_button) this.rows[i].delete_button.disabled = true;
@@ -18215,7 +18004,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
   },
   preBuild: function() {
     this._super();
-
+    
     this.rows = [];
     this.row_cache = [];
 
@@ -18310,22 +18099,22 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
   },
   getItemInfo: function(i) {
     var schema = this.getItemSchema(i);
-
+    
     // Check if it's cached
     this.item_info = this.item_info || {};
     var stringified = JSON.stringify(schema);
     if(typeof this.item_info[stringified] !== "undefined") return this.item_info[stringified];
-
+    
     // Get the schema for this item
     schema = this.jsoneditor.expandRefs(schema);
-
+      
     this.item_info[stringified] = {
       title: schema.title || "item",
       'default': schema.default,
       width: 12,
       child_editors: schema.properties || schema.items
     };
-
+    
     return this.item_info[stringified];
   },
   getElementEditor: function(i) {
@@ -18365,7 +18154,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
       ret.array_controls = this.theme.getButtonHolder();
       holder.appendChild(ret.array_controls);
     }
-
+    
     return ret;
   },
   destroy: function() {
@@ -18375,7 +18164,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     if(this.row_holder && this.row_holder.parentNode) this.row_holder.parentNode.removeChild(this.row_holder);
     if(this.controls && this.controls.parentNode) this.controls.parentNode.removeChild(this.controls);
     if(this.panel && this.panel.parentNode) this.panel.parentNode.removeChild(this.panel);
-
+    
     this.rows = this.row_cache = this.title = this.description = this.row_holder = this.panel = this.controls = null;
 
     this._super();
@@ -18438,9 +18227,9 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
   setValue: function(value, initial) {
     // Update the array's value, adding/removing rows when necessary
     value = value || [];
-
+    
     if(!(Array.isArray(value))) value = [value];
-
+    
     var serialized = JSON.stringify(value);
     if(serialized === this.serialized) return;
 
@@ -18491,10 +18280,11 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     self.active_tab = new_active_tab;
 
     self.refreshValue(initial);
+    self.refreshTabs(true);
     self.refreshTabs();
 
     self.onChange();
-
+    
     // TODO: sortable
   },
   refreshValue: function(force) {
@@ -18506,11 +18296,11 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
       // Get the value for this editor
       self.value[i] = editor.getValue();
     });
-
+    
     if(oldi !== this.value.length || force) {
       // If we currently have minItems items in the array
       var minItems = this.schema.minItems && this.schema.minItems >= this.rows.length;
-
+      
       $each(this.rows,function(i,editor) {
         // Hide the move down button for the last row
         if(editor.movedown_buttons) {
@@ -18535,15 +18325,15 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
         // Get the value for this editor
         self.value[i] = editor.getValue();
       });
-
+      
       var controls_needed = false;
-
+      
       if(!this.value.length) {
         this.delete_last_row_button.style.display = 'none';
         this.remove_all_rows_button.style.display = 'none';
       }
-      else if(this.value.length === 1) {
-        this.remove_all_rows_button.style.display = 'none';
+      else if(this.value.length === 1) {      
+        this.remove_all_rows_button.style.display = 'none';  
 
         // If there are minItems items in the array, hide the delete button beneath the rows
         if(minItems || this.hide_delete_buttons) {
@@ -18574,8 +18364,8 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
       else {
         this.add_row_button.style.display = '';
         controls_needed = true;
-      }
-
+      } 
+      
       if(!this.collapsed && controls_needed) {
         this.controls.style.display = 'inline-block';
       }
@@ -18587,7 +18377,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
   addRow: function(value, initial) {
     var self = this;
     var i = this.rows.length;
-
+    
     self.rows[i] = this.getElementEditor(i);
     self.row_cache[i] = self.rows[i];
 
@@ -18604,9 +18394,9 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
 
       self.theme.addTab(self.tabs_holder, self.rows[i].tab);
     }
-
+    
     var controls_holder = self.rows[i].title_controls || self.rows[i].array_controls;
-
+    
     // Buttons to delete row, move row up, and move row down
     if(!self.hide_delete_buttons) {
       self.rows[i].delete_button = this.getButton(self.getItemTitle(),'delete','Delete '+self.getItemTitle());
@@ -18631,7 +18421,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
               // Otherwise, make the previous tab active if there is one
               else if(j) new_active_tab = self.rows[j-1].tab;
             }
-
+            
             return; // If this is the one we're deleting
           }
           newval.push(row);
@@ -18644,12 +18434,12 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
 
         self.onChange(true);
       });
-
+      
       if(controls_holder) {
         controls_holder.appendChild(self.rows[i].delete_button);
       }
     }
-
+    
     if(i && !self.hide_move_buttons) {
       self.rows[i].moveup_button = this.getButton('','moveup','Move up');
       self.rows[i].moveup_button.className += ' moveup';
@@ -18671,12 +18461,12 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
 
         self.onChange(true);
       });
-
+      
       if(controls_holder) {
         controls_holder.appendChild(self.rows[i].moveup_button);
       }
     }
-
+    
     if(!self.hide_move_buttons) {
       self.rows[i].movedown_button = this.getButton('','movedown','Move down');
       self.rows[i].movedown_button.className += ' movedown';
@@ -18697,7 +18487,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
         self.refreshTabs();
         self.onChange(true);
       });
-
+      
       if(controls_holder) {
         controls_holder.appendChild(self.rows[i].movedown_button);
       }
@@ -18708,7 +18498,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
   },
   addControls: function() {
     var self = this;
-
+    
     this.collapsed = false;
     this.toggle_button = this.getButton('','collapse','Collapse');
     this.title_controls.appendChild(this.toggle_button);
@@ -18739,7 +18529,7 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     if(this.options.collapsed) {
       $trigger(this.toggle_button,'click');
     }
-
+    
     // Collapse button disabled
     if(this.schema.options && typeof this.schema.options.disable_collapse !== "undefined") {
       if(this.schema.options.disable_collapse) this.toggle_button.style.display = 'none';
@@ -18747,10 +18537,10 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     else if(this.jsoneditor.options.disable_collapse) {
       this.toggle_button.style.display = 'none';
     }
-
+    
     // Add "new row" and "delete last" buttons below editor
     this.add_row_button = this.getButton(this.getItemTitle(),'add','Add '+this.getItemTitle());
-
+    
     this.add_row_button.addEventListener('click',function(e) {
       e.preventDefault();
       e.stopPropagation();
@@ -18776,10 +18566,10 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
       e.preventDefault();
       e.stopPropagation();
       var rows = self.getValue();
-
+      
       var new_active_tab = null;
       if(self.rows.length > 1 && self.rows[self.rows.length-1].tab === self.active_tab) new_active_tab = self.rows[self.rows.length-2].tab;
-
+      
       rows.pop();
       self.setValue(rows);
       if(new_active_tab) {
@@ -18803,11 +18593,11 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
       this.add_row_button.style.width = '100%';
       this.add_row_button.style.textAlign = 'left';
       this.add_row_button.style.marginBottom = '3px';
-
+      
       this.delete_last_row_button.style.width = '100%';
       this.delete_last_row_button.style.textAlign = 'left';
       this.delete_last_row_button.style.marginBottom = '3px';
-
+      
       this.remove_all_rows_button.style.width = '100%';
       this.remove_all_rows_button.style.textAlign = 'left';
       this.remove_all_rows_button.style.marginBottom = '3px';
@@ -18895,7 +18685,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     var tmp = this.getElementEditor(0,true);
     this.item_default = tmp.getDefault();
     this.width = tmp.getNumColumns() + 2;
-
+    
     if(!this.options.compact) {
       this.title = this.theme.getHeader(this.getTitle());
       this.container.appendChild(this.title);
@@ -18920,11 +18710,13 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     this.panel.appendChild(this.controls);
 
     if(this.item_has_child_editors) {
-      $each(tmp.getChildEditors(), function(i,editor) {
-        var th = self.theme.getTableHeaderCell(editor.getTitle());
-        if(editor.options.hidden) th.style.display = 'none';
+      var ce = tmp.getChildEditors();
+      var order = tmp.property_order || Object.keys(ce);
+      for(var i=0; i<order.length; i++) {
+        var th = self.theme.getTableHeaderCell(ce[order[i]].getTitle());
+        if(ce[order[i]].options.hidden) th.style.display = 'none';
         self.header_row.appendChild(th);
-      });
+      }
     }
     else {
       self.header_row.appendChild(self.theme.getTableHeaderCell(this.item_title));
@@ -18969,7 +18761,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
       compact: true,
       table_row: true
     });
-
+    
     ret.preBuild();
     if(!ignore) {
       ret.build();
@@ -18982,7 +18774,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
       ret.table_controls.style.margin = 0;
       ret.table_controls.style.padding = 0;
     }
-
+    
     return ret;
   },
   destroy: function() {
@@ -19010,7 +18802,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     if(this.schema.maxItems && value.length > this.schema.maxItems) {
       value = value.slice(0,this.schema.maxItems);
     }
-
+    
     var serialized = JSON.stringify(value);
     if(serialized === this.serialized) return;
 
@@ -19044,15 +18836,15 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     if(numrows_changed || initial) self.refreshRowButtons();
 
     self.onChange();
-
+          
     // TODO: sortable
   },
   refreshRowButtons: function() {
     var self = this;
-
+    
     // If we currently have minItems items in the array
     var minItems = this.schema.minItems && this.schema.minItems >= this.rows.length;
-
+    
     var need_row_buttons = false;
     $each(this.rows,function(i,editor) {
       // Hide the move down button for the last row
@@ -19076,12 +18868,12 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
           editor.delete_button.style.display = '';
         }
       }
-
+      
       if(editor.moveup_button) {
         need_row_buttons = true;
       }
     });
-
+    
     // Show/hide controls column in table
     $each(this.rows,function(i,editor) {
       if(need_row_buttons) {
@@ -19097,9 +18889,9 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     else {
       this.controls_header_cell.style.display = 'none';
     }
-
+    
     var controls_needed = false;
-
+  
     if(!this.value.length) {
       this.delete_last_row_button.style.display = 'none';
       this.remove_all_rows_button.style.display = 'none';
@@ -19140,7 +18932,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
       this.add_row_button.style.display = '';
       controls_needed = true;
     }
-
+    
     if(!controls_needed) {
       this.controls.style.display = 'none';
     }
@@ -19189,7 +18981,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
       controls_holder.appendChild(self.rows[i].delete_button);
     }
 
-
+    
     if(i && !this.hide_move_buttons) {
       self.rows[i].moveup_button = this.getButton('','moveup','Move up');
       self.rows[i].moveup_button.className += ' moveup';
@@ -19210,7 +19002,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
       });
       controls_holder.appendChild(self.rows[i].moveup_button);
     }
-
+    
     if(!this.hide_move_buttons) {
       self.rows[i].movedown_button = this.getButton('','movedown','Move down');
       self.rows[i].movedown_button.className += ' movedown';
@@ -19275,7 +19067,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     this.add_row_button.addEventListener('click',function(e) {
       e.preventDefault();
       e.stopPropagation();
-
+      
       self.addRow();
       self.refreshValue();
       self.refreshRowButtons();
@@ -19287,7 +19079,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     this.delete_last_row_button.addEventListener('click',function(e) {
       e.preventDefault();
       e.stopPropagation();
-
+      
       var rows = self.getValue();
       rows.pop();
       self.setValue(rows);
@@ -19299,7 +19091,7 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     this.remove_all_rows_button.addEventListener('click',function(e) {
       e.preventDefault();
       e.stopPropagation();
-
+      
       self.setValue([]);
       self.onChange(true);
     });
@@ -19354,11 +19146,11 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
   },
   switchEditor: function(i) {
     var self = this;
-
+    
     if(!this.editors[i]) {
       this.buildChildEditor(i);
     }
-
+    
     self.type = i;
 
     self.register();
@@ -19383,7 +19175,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
     self.editor_holder.appendChild(holder);
 
     var schema;
-
+    
     if(typeof type === "string") {
       schema = $extend({},self.schema);
       schema.type = type;
@@ -19411,11 +19203,11 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
     self.editors[i].preBuild();
     self.editors[i].build();
     self.editors[i].postBuild();
-
+    
     if(self.editors[i].header) self.editors[i].header.style.display = 'none';
-
+    
     self.editors[i].option = self.switcher_options[i];
-
+    
     holder.addEventListener('change_header_text',function() {
       self.refreshHeaderText();
     });
@@ -19478,7 +19270,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
     this.switcher.addEventListener('change',function(e) {
       e.preventDefault();
       e.stopPropagation();
-
+      
       self.switchEditor(self.display_text.indexOf(this.value));
       self.onChange(true);
     });
@@ -19493,9 +19285,9 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
     this.switcher_options = this.theme.getSwitcherOptions(this.switcher);
     $each(this.types,function(i,type) {
       self.editors[i] = false;
-
+      
       var schema;
-
+      
       if(typeof type === "string") {
         schema = $extend({},self.schema);
         schema.type = type;
@@ -19511,7 +19303,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
 
       self.validators[i] = new JSONEditor.Validator(self.jsoneditor,schema);
     });
-
+    
     this.switchEditor(0);
   },
   onChildEditorChange: function(editor) {
@@ -19519,7 +19311,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
       this.refreshValue();
       this.refreshHeaderText();
     }
-
+    
     this._super();
   },
   refreshHeaderText: function() {
@@ -19541,7 +19333,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
         return false;
       }
     });
-
+    
     this.switchEditor(this.type);
 
     this.editors[this.type].setValue(val,initial);
@@ -19559,7 +19351,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
   },
   showValidationErrors: function(errors) {
     var self = this;
-
+    
     // oneOf error paths need to remove the oneOf[i] part before passing to child editors
     if(this.oneOf) {
       $each(this.editors,function(i,editor) {
@@ -19573,7 +19365,7 @@ JSONEditor.defaults.editors.multiple = JSONEditor.AbstractEditor.extend({
             new_errors.push(new_error);
           }
         });
-
+        
         editor.showValidationErrors(new_errors);
       });
     }
@@ -19622,7 +19414,7 @@ JSONEditor.defaults.editors.enum = JSONEditor.AbstractEditor.extend({
     this.display_area.style.paddingTop = 0;
     this.display_area.style.paddingBottom = 0;
     this.container.appendChild(this.display_area);
-
+    
     if(this.options.hide_display) this.display_area.style.display = "none";
 
     this.switcher.addEventListener('change',function() {
@@ -19686,7 +19478,7 @@ JSONEditor.defaults.editors.enum = JSONEditor.AbstractEditor.extend({
         // TODO: use theme
         ret += '<li>'+html+'</li>';
       });
-
+      
       if(Array.isArray(el)) ret = '<ol>'+ret+'</ol>';
       else ret = "<ul style='margin-top:0;margin-bottom:0;padding-top:0;padding-bottom:0;'>"+ret+'</ul>';
 
@@ -19785,7 +19577,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
     // Enum options enumerated
     if(this.schema.enum) {
       var display = this.schema.options && this.schema.options.enum_titles || [];
-
+      
       $each(this.schema.enum,function(i,option) {
         self.enum_options[i] = ""+option;
         self.enum_display[i] = ""+(display[i] || option);
@@ -19794,7 +19586,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
     }
     // Boolean
     else if(this.schema.type === "boolean") {
-      self.enum_display = ['true','false'];
+      self.enum_display = this.schema.options && this.schema.options.enum_titles || ['true','false'];
       self.enum_options = ['1',''];
       self.enum_values = [true,false];
     }
@@ -19804,7 +19596,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
       this.enum_display = [];
       this.enum_options = [];
       this.enum_values = [];
-
+      
       // Shortcut declaration for using a single array
       if(!(Array.isArray(this.schema.enumSource))) {
         if(this.schema.enumValue) {
@@ -19840,7 +19632,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
           }
         }
       }
-
+      
       // Now, enumSource is an array of sources
       // Walk through this array and fix up the values
       for(i=0; i<this.enumSource.length; i++) {
@@ -19865,7 +19657,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
     if(!this.options.compact) this.header = this.label = this.theme.getFormInputLabel(this.getTitle());
     if(this.schema.description) this.description = this.theme.getFormInputDescription(this.schema.description);
 
-    if(this.options.compact) this.container.setAttribute('class',this.container.getAttribute('class')+' compact');
+    if(this.options.compact) this.container.className += ' compact';
 
     this.input = this.theme.getSelectInput(this.enum_options);
     this.theme.setSelectOptions(this.input,this.enum_options,this.enum_display);
@@ -19921,13 +19713,13 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
   },
   onWatchedFieldChange: function() {
     var self = this, vars, j;
-
+    
     // If this editor uses a dynamic select box
     if(this.enumSource) {
       vars = this.getWatchedFieldValues();
       var select_options = [];
       var select_titles = [];
-
+      
       for(var i=0; i<this.enumSource.length; i++) {
         // Constant values
         if(Array.isArray(this.enumSource[i])) {
@@ -19937,7 +19729,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
         // A watched field
         else if(vars[this.enumSource[i].source]) {
           var items = vars[this.enumSource[i].source];
-
+          
           // Only use a predefined part of the array
           if(this.enumSource[i].slice) {
             items = Array.prototype.slice.apply(items,this.enumSource[i].slice);
@@ -19950,12 +19742,12 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
             }
             items = new_items;
           }
-
+          
           var item_titles = [];
           var item_values = [];
           for(j=0; j<items.length; j++) {
             var item = items[j];
-
+            
             // Rendered value
             if(this.enumSource[i].value) {
               item_values[j] = this.enumSource[i].value({
@@ -19967,7 +19759,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
             else {
               item_values[j] = items[j];
             }
-
+            
             // Rendered title
             if(this.enumSource[i].title) {
               item_titles[j] = this.enumSource[i].title({
@@ -19980,25 +19772,25 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
               item_titles[j] = item_values[j];
             }
           }
-
+          
           // TODO: sort
-
+          
           select_options = select_options.concat(item_values);
           select_titles = select_titles.concat(item_titles);
         }
       }
-
+      
       var prev_value = this.value;
-
+      
       this.theme.setSelectOptions(this.input, select_options, select_titles);
       this.enum_options = select_options;
       this.enum_display = select_titles;
       this.enum_values = select_options;
-
+      
       if(this.select2) {
         this.select2.select2('destroy');
       }
-
+      
       // If the previous value is still in the new select options, stick with it
       if(select_options.indexOf(prev_value) !== -1) {
         this.input.value = prev_value;
@@ -20007,12 +19799,12 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
       // Otherwise, set the value to the first select option
       else {
         this.input.value = select_options[0];
-        this.value = select_options[0] || "";
+        this.value = select_options[0] || "";  
         if(this.parent) this.parent.onChildEditorChange(this);
         else this.jsoneditor.onChange();
         this.jsoneditor.notifyWatchers(this.path);
       }
-
+      
       this.setupSelect2();
     }
 
@@ -20211,25 +20003,25 @@ JSONEditor.defaults.editors.base64 = JSONEditor.AbstractEditor.extend({
   getNumColumns: function() {
     return 4;
   },
-  build: function() {
+  build: function() {    
     var self = this;
     this.title = this.header = this.label = this.theme.getFormInputLabel(this.getTitle());
 
     // Input that holds the base64 string
     this.input = this.theme.getFormInputField('hidden');
     this.container.appendChild(this.input);
-
+    
     // Don't show uploader if this is readonly
     if(!this.schema.readOnly && !this.schema.readonly) {
       if(!window.FileReader) throw "FileReader required for base64 editor";
-
+      
       // File uploader
       this.uploader = this.theme.getFormInputField('file');
-
+      
       this.uploader.addEventListener('change',function(e) {
         e.preventDefault();
         e.stopPropagation();
-
+        
         if(this.files && this.files.length) {
           var fr = new FileReader();
           fr.onload = function(evt) {
@@ -20252,14 +20044,14 @@ JSONEditor.defaults.editors.base64 = JSONEditor.AbstractEditor.extend({
   refreshPreview: function() {
     if(this.last_preview === this.value) return;
     this.last_preview = this.value;
-
+    
     this.preview.innerHTML = '';
-
+    
     if(!this.value) return;
-
+    
     var mime = this.value.match(/^data:([^;,]+)[;,]/);
     if(mime) mime = mime[1];
-
+    
     if(!mime) {
       this.preview.innerHTML = '<em>Invalid data URI</em>';
     }
@@ -20305,14 +20097,14 @@ JSONEditor.defaults.editors.upload = JSONEditor.AbstractEditor.extend({
   getNumColumns: function() {
     return 4;
   },
-  build: function() {
+  build: function() {    
     var self = this;
     this.title = this.header = this.label = this.theme.getFormInputLabel(this.getTitle());
 
     // Input that holds the base64 string
     this.input = this.theme.getFormInputField('hidden');
     this.container.appendChild(this.input);
-
+    
     // Don't show uploader if this is readonly
     if(!this.schema.readOnly && !this.schema.readonly) {
 
@@ -20320,11 +20112,11 @@ JSONEditor.defaults.editors.upload = JSONEditor.AbstractEditor.extend({
 
       // File uploader
       this.uploader = this.theme.getFormInputField('file');
-
+      
       this.uploader.addEventListener('change',function(e) {
         e.preventDefault();
         e.stopPropagation();
-
+        
         if(this.files && this.files.length) {
           var fr = new FileReader();
           fr.onload = function(evt) {
@@ -20352,7 +20144,7 @@ JSONEditor.defaults.editors.upload = JSONEditor.AbstractEditor.extend({
     this.last_preview = this.preview_value;
 
     this.preview.innerHTML = '';
-
+    
     if(!this.preview_value) return;
 
     var self = this;
@@ -20471,7 +20263,7 @@ JSONEditor.AbstractTheme = Class.extend({
     return el;
   },
   setGridColumnSize: function(el,size) {
-
+    
   },
   getLink: function(text) {
     var el = document.createElement('a');
@@ -20509,7 +20301,7 @@ JSONEditor.AbstractTheme = Class.extend({
     else {
       el.appendChild(text);
     }
-
+    
     return el;
   },
   getCheckbox: function() {
@@ -20588,7 +20380,7 @@ JSONEditor.AbstractTheme = Class.extend({
     return el;
   },
   afterInputReady: function(input) {
-
+    
   },
   getFormControl: function(label, input, description) {
     var el = document.createElement('div');
@@ -20600,7 +20392,7 @@ JSONEditor.AbstractTheme = Class.extend({
     else {
       el.appendChild(input);
     }
-
+    
     if(description) el.appendChild(description);
     return el;
   },
@@ -21001,7 +20793,7 @@ JSONEditor.defaults.themes.bootstrap3 = JSONEditor.AbstractTheme.extend({
       group.appendChild(label);
       input.style.position = 'relative';
       input.style.cssFloat = 'left';
-    }
+    } 
     else {
       group.className += ' form-group';
       if(label) {
@@ -21192,7 +20984,7 @@ JSONEditor.defaults.themes.foundation = JSONEditor.AbstractTheme.extend({
   addInputError: function(input,text) {
     if(!input.group) return;
     input.group.className += ' error';
-
+    
     if(!input.errmsg) {
       input.insertAdjacentHTML('afterend','<small class="error"></small>');
       input.errmsg = input.parentNode.getElementsByClassName('error')[0];
@@ -21200,7 +20992,7 @@ JSONEditor.defaults.themes.foundation = JSONEditor.AbstractTheme.extend({
     else {
       input.errmsg.style.display = '';
     }
-
+    
     input.errmsg.textContent = text;
   },
   removeInputError: function(input) {
@@ -21393,7 +21185,7 @@ JSONEditor.defaults.themes.html = JSONEditor.AbstractTheme.extend({
   },
   addInputError: function(input, text) {
     input.style.borderColor = 'red';
-
+    
     if(!input.errmsg) {
       var group = this.closest(input,'.form-control');
       input.errmsg = document.createElement('div');
@@ -21405,7 +21197,7 @@ JSONEditor.defaults.themes.html = JSONEditor.AbstractTheme.extend({
     else {
       input.errmsg.style.display = 'block';
     }
-
+    
     input.errmsg.innerHTML = '';
     input.errmsg.appendChild(document.createTextNode(text));
   },
@@ -21466,7 +21258,7 @@ JSONEditor.defaults.themes.jqueryui = JSONEditor.AbstractTheme.extend({
     var el = this._super(label,input,description);
     if(input.type === 'checkbox') {
       el.style.lineHeight = '25px';
-
+      
       el.style.padding = '3px 0';
     }
     else {
@@ -21521,7 +21313,7 @@ JSONEditor.defaults.themes.jqueryui = JSONEditor.AbstractTheme.extend({
     button.appendChild(el);
 
     button.setAttribute('title',title);
-
+    
     return button;
   },
   setButtonText: function(button,text, icon, title) {
@@ -21607,9 +21399,9 @@ JSONEditor.AbstractIconLib = Class.extend({
   },
   getIcon: function(key) {
     var iconclass = this.getIconClass(key);
-
+    
     if(!iconclass) return null;
-
+    
     var i = document.createElement('i');
     i.className = iconclass;
     return i;
@@ -21738,12 +21530,12 @@ JSONEditor.defaults.templates.default = function() {
     });
     return expanded;
   };
-
+  
   return {
     compile: function(template) {
       return function (vars) {
         var expanded = expandVars(vars);
-
+        
         var ret = template+"";
         // Only supports basic {{var}} macro replacement
         $each(expanded,function(key,value) {
@@ -21841,17 +21633,17 @@ JSONEditor.defaults.options = {};
 JSONEditor.defaults.translate = function(key, variables) {
   var lang = JSONEditor.defaults.languages[JSONEditor.defaults.language];
   if(!lang) throw "Unknown language "+JSONEditor.defaults.language;
-
+  
   var string = lang[key] || JSONEditor.defaults.languages[JSONEditor.defaults.default_language][key];
-
+  
   if(typeof string === "undefined") throw "Unknown translate string "+key;
-
+  
   if(variables) {
     for(var i=0; i<variables.length; i++) {
       string = string.replace(new RegExp('\\{\\{'+i+'}}','g'),variables[i]);
     }
   }
-
+  
   return string;
 };
 
@@ -21998,7 +21790,7 @@ JSONEditor.plugins = {
 
   },
   select2: {
-
+    
   }
 };
 
@@ -22083,13 +21875,13 @@ JSONEditor.defaults.resolvers.unshift(function(schema) {
   if(window.jQuery || window.Zepto) {
     var $ = window.jQuery || window.Zepto;
     $.jsoneditor = JSONEditor.defaults;
-
+    
     $.fn.jsoneditor = function(options) {
       var self = this;
       var editor = this.data('jsoneditor');
       if(options === 'value') {
         if(!editor) throw "Must initialize jsoneditor before getting/setting the value";
-
+        
         // Set value
         if(arguments.length > 1) {
           editor.setValue(arguments[1]);
@@ -22101,7 +21893,7 @@ JSONEditor.defaults.resolvers.unshift(function(schema) {
       }
       else if(options === 'validate') {
         if(!editor) throw "Must initialize jsoneditor before validating";
-
+        
         // Validate a specific value
         if(arguments.length > 1) {
           return editor.validate(arguments[1]);
@@ -22122,11 +21914,11 @@ JSONEditor.defaults.resolvers.unshift(function(schema) {
         if(editor) {
           editor.destroy();
         }
-
+        
         // Create editor
         editor = new JSONEditor(this.get(0),options);
         this.data('jsoneditor',editor);
-
+        
         // Setup event listeners
         editor.on('change',function() {
           self.trigger('change');
@@ -22135,15 +21927,17 @@ JSONEditor.defaults.resolvers.unshift(function(schema) {
           self.trigger('ready');
         });
       }
-
+      
       return this;
     };
   }
 })();
 
-  module.exports = JSONEditor;
+  window.JSONEditor = JSONEditor;
 })();
 
+},{}],"json-editor":[function(require,module,exports){
+module.exports=require('pRDjjY');
 },{}],"3pLyGF":[function(require,module,exports){
 /*!
  * mustache.js - Logic-less {{mustache}} templates with JavaScript
@@ -24153,7 +23947,7 @@ var Loader = function() {
   // will be replaced with the json.
   this.dependencies = {"npm":{"mustache":"latest","domify":"0.x.x","json-editor":"latest","underscore":"1.x.x","dot-object":"0.x.x"}};
   //this.nodes = ;
-  this.nodeDefinitions = {"./graph/{ns}/{name}.fbp":{"models":{"model":{"id":"MyModel","type":"flow","nodes":[{"id":"73063a26-ad89-432d-ae19-cfc706a6949d","title":"Commands","ns":"object","name":"keys"},{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","title":"CommandsPicker","ns":"data","name":"pick"},{"id":"2e0da911-6c0e-413c-b8b0-9e62f2637b30","title":"ProtocolSchemas","ns":"object","name":"create","context":{"in":{"network":{"title":"Network protocol","description":"Protocol for starting and stopping FBP networks, and finding out about their state.","output":{"stopped":{"title":"Stopped","description":"Inform that a given network has stopped.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was stopped"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"time the network was running, in seconds"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"started":{"title":"Started","description":"Inform that a given network has been started.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was started"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"status":{"title":"Status","description":"Response to a getstatus message.","type":"object","properties":{"running":{"title":"Running","type":"boolean","description":"boolean tells whether the network is running or not"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"(optional) time the network has been running, in seconds"}}},"output":{"description":"An output message from a running network, roughly similar to STDOUT output of a Unix process, or a line of console.log in JavaScript. Output can also be used for passing images from the runtime to the UI.","properties":{"message":{"type":"string","description":"contents of the output line"},"type":{"type":"string","enum":["message","previewurl"],"description":"(optional) type of output, either message or previewurl"},"url":{"type":"string","format":"uri","description":"(optional) URL for an image generated by the runtime"}}},"error":{"description":"An error from a running network, roughly similar to STDERR output of a Unix process, or a line of console.error in JavaScript.","properties":{"message":{"type":"any","description":"contents of the error message"}}},"icon":{"description":"Icon of a component instance has changed.","properties":{"id":{"type":"string","description":"identifier of the node"},"icon":{"type":"string","description":"new icon for the component instance"},"graph":{"type":"string","description":"graph the action targets"}}},"connect":{"description":"Beginning of transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"begingroup":{"description":"Beginning of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"data":{"description":"Data transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"data":{"type":"any","description":"actual data being transmitted, encoded in a way that can be carried over the protocol transport"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"endgroup":{"description":"Ending of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"description":"graph the action targets","type":"string"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"disconnect":{"description":"End of transmission on an edge.","properties":{"id":{"description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}}},"input":{"error":{"description":"Network error"},"start":{"description":"Start execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"getstatus":{"description":"Get the current status of the runtime. The runtime should respond with a status message.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"stop":{"description":"Stop execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"edges":{"description":"List of edges user has selected for inspection in a user interface or debugger, sent from UI to a runtime.","edges":{"type":"array","description":"list of selected edges, each containing","properties":{"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"},"graph":{"type":"string","description":"graph the action targets"}}}}}}}},"component":{"title":"Component protocol","description":"Protocol for handling the component registry.","output":{"error":{"description":"Component error"},"component":{"title":"Component","description":"Transmit the metadata about a component instance.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"component name in format that can be used in graphs"},"description":{"title":"Description","type":"string","description":"(optional) textual description on what the component does"},"icon":{"title":"Icon","type":"string","description":"(optional): visual icon for the component, matching icon names in [Font Awesome](http://fortawesome.github.io/Font-Awesome/icons/)"},"subgraph":{"title":"Subgraph","type":"boolean","description":"boolean telling whether the component is a subgraph"},"inPorts":{"title":"Input Ports","description":"list of input ports, each containing:","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"values":{"title":"Values","type":"array","description":"(optional) array of the values that the port accepts for enum ports"},"default":{"title":"Default","type":"any","description":"(optional) the default value received by the port"}}},"outPorts":{"description":"list of output ports","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"}}}}},"source":{"description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}},"input":{"error":{"title":"Error","description":"Component error","type":"object"},"list":{"title":"List","description":"Request a list of currently available components. Will be responded with a set of `component` messages.","type":"object"},"getsource":{"title":"Get Source","description":"Request for the source code of a given component. Will be responded with a `source` message.","type":"object","properties":{"name":{"type":"string","description":"Name of the component to get source code for"}}},"source":{"title":"Source code","description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}}},"runtime":{"title":"Runtime protocol","description":"When a client connects to a FBP procotol it may choose to discover the capabilities and other information about the runtime.","input":{"error":{"title":"Error","description":"Runtime error","type":"object"},"getruntime":{"title":"Get runtime","description":"Request the information about the runtime. When receiving this message the runtime should response with a runtime message.","type":"object"},"packet":{"title":"Packet","description":"Runtimes that can be used as remote subgraphs (i.e. ones that have reported supporting the protocol:runtime capability) need to be able to receive and transmit information packets at their exposed ports.\nThese packets can be send from the client to the runtime's input ports, or from runtime's output ports to the client.","type":"object","properties":{"port":{"title":"Port","type":"string","description":"port name for the input or output port"},"event":{"title":"Event","type":"string","enum":["connect","begingroup","data","endgroup","disconnect"],"description":"packet event"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"payload":{"title":"Payload","type":"object","description":"(optional) payload for the packet. Used only with begingroup (for group names) and data packets"}}}},"output":{"error":{"title":"Error","description":"Runtime error","type":"object"},"ports":{"title":"Ports","description":"Message sent by the runtime to signal its available ports. The runtime is responsible for sending the up-to-date list of available ports back to client whenever it changes.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"ID of the currently configured main graph running on the runtime"},"inPorts":{"title":"Input ports","description":"list of input ports","type":"array","items":{"type":"object","properties":{"addressable":{"title":"addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","description":"port datatype, for example boolean","type":"string"},"required":{"title":"Required","description":"boolean telling whether the port needs to be connected for the component to work","type":"boolean"},"description":{"title":"Description","type":"string","description":"textual description of the port"}}}},"outPorts":{"title":"Output ports","description":"list of output ports","type":"array","items":{"type":"object","properties":{"description":{"type":"string","description":"textual description of the port"},"required":{"type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"type":{"description":"port datatype, for example boolean","type":"string"},"id":{"description":"port name","type":"string"},"addressable":{"description":"boolean telling whether the port is an ArrayPort","type":"boolean"}}}}}},"runtime":{"title":"Runtime","description":"Response from the runtime to the getruntime request.","type":"object","properties":{"id":{"title":"ID","type":"string","required":false,"description":"(optional) runtime ID used with Flowhub Registry"},"label":{"title":"Label","description":"(optional) Human-readable description of the runtime","type":"string","required":false},"version":{"title":"Version","description":"version of the runtime protocol that the runtime supports, for example 0.4","type":"string"},"capabilities":{"title":"Capabilities","type":"array","items":{"protocol:network":{"description":"the runtime is able to control and introspect its running networks using the Network protocol"},"protocol:component":{"description":"the runtime is able to list and modify its components using the Component protocol"},"protocol:runtime":{"description":"the runtime is able to expose the ports of its main graph using the Runtime protocol and transmit packet information to/from them"},"component:getsource":{"description":"runtime is able to read and send component source code back to client"},"network:persist":{"description":"runtime is able to *flash* a running graph setup into itself, making it persistent across reboots"},"protocol:graph":{"description":"the runtime is able to modify its graphs using the Graph protocol"},"component:setsource":{"description":"runtime is able to compile and run custom components sent as source code strings"}},"description":"array of capability strings for things the runtime is able to do\nIf the runtime is currently running a graph and it is able to speak the full Runtime protocol, it should follow up with a ports message."},"graph":{"title":"Graph","description":"(optional) ID of the currently configured main graph running on the runtime, if any","type":"string","required":false},"type":{"title":"Type","description":"type of the runtime, for example noflo-nodejs or microflo","type":"string"}}}}},"graph":{"title":"Graph protocol","description":"This protocol is utilized for communicating about graph changes in both directions.","output":{"error":{"description":"Graph error","type":"object"},"addnode":{"description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":"string","description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}}},"input":{"error":{"title":"Error","description":"Graph error","type":"object"},"clear":{"title":"Clear","description":"Initialize an empty graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the graph being created. Used for all subsequent messages related to the graph instance","required":true},"name":{"title":"Name","type":"string","description":"(optional) Human-readable label for the graph"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"main":{"title":"Main","type":"boolean","description":"(optional) Identifies the graph as a main graph of a project that should not be registered as a component\nGraphs registered in this way should also be available for use as subgraphs in other graphs. Therefore a graph registration and later changes to it may cause component messages of the Component protocol to be sent back to the client informing of possible changes in the ports of the subgraph component."}}},"subscribe":{"title":"Subscribe","description":"Subscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to subscribe to","required":true}}},"unsubscribe":{"title":"Unsubscribe","description":"Unsubscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to unsubscribe from","required":true}}},"addnode":{"title":"Add node","description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"title":"Removenode","description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"title":"Rename node","description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"title":"Add edge","description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","description":"graph the action targets"}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"titile":"Graph","type":"string","description":"graph the action targets"},"src":{"titile":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"Rename inport","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}}}}}}},{"id":"e23e2939-6452-4809-8688-81d5e346d8b1","title":"Log","ns":"console","name":"log"},{"id":"717f35f2-ea36-4480-9c62-0bbd84aee7e4","title":"CommandKey","ns":"object","name":"keys"},{"id":"b702972c-9072-446d-adbc-c18fb7fd8294","title":"GetCommands","ns":"object","name":"keys"},{"id":"04cba889-8707-46a9-8d68-fa484a5eb890","title":"BuildPath","ns":"string","name":"append","context":{"append":".input"}},{"id":"20fd4de6-1ed7-4887-83d2-40951d765204","title":"PrepareCommand","ns":"array","name":"map","context":{"fn":"\n return {\n   label: val,\n   value: val\n }\n"}},{"id":"fca2fe7b-346f-40c4-89e4-8808143e02d2","title":"PickSchema","ns":"data","name":"pick"}],"links":[{"id":"63f3d1d0-a5c1-477d-afdc-77fb9ce70063","source":{"id":"b702972c-9072-446d-adbc-c18fb7fd8294","port":"out","setting":{"index":0}},"target":{"id":"04cba889-8707-46a9-8d68-fa484a5eb890","port":"in"},"metadata":{"title":"GetCommands out -> in BuildPath"}},{"id":"2adcd0e1-7d04-44cc-abf4-af8c59403960","source":{"id":"04cba889-8707-46a9-8d68-fa484a5eb890","port":"out"},"target":{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","port":"path"},"metadata":{"title":"BuildPath out -> path CommandsPicker"}},{"id":"965b6bba-24f2-4a87-9f8c-f829cc500269","source":{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","port":"out"},"target":{"id":"e23e2939-6452-4809-8688-81d5e346d8b1","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"c2c909b4-b99b-4b99-abaa-b1dbec94420a","source":{"id":"04cba889-8707-46a9-8d68-fa484a5eb890","port":"out"},"target":{"id":"e23e2939-6452-4809-8688-81d5e346d8b1","port":"msg"},"metadata":{"title":"BuildPath out -> msg Log"}},{"id":"3a4f2a23-94c7-417c-88a6-0b7d53af62ec","source":{"id":"2e0da911-6c0e-413c-b8b0-9e62f2637b30","port":"out"},"target":{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","port":"in","setting":{"persist":true}},"metadata":{"title":"ProtocolSchemas out -> in CommandsPicker"}},{"id":"0a67e4b3-f87e-44e3-a1af-9ac9b8978829","source":{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","port":"out"},"target":{"id":"73063a26-ad89-432d-ae19-cfc706a6949d","port":"in"},"metadata":{"title":"CommandsPicker out -> in Commands"}},{"id":"f442b2bd-7302-4f8c-8952-cb4a4c3c53e8","source":{"id":"73063a26-ad89-432d-ae19-cfc706a6949d","port":"out"},"target":{"id":"e23e2939-6452-4809-8688-81d5e346d8b1","port":"msg"},"metadata":{"title":"Commands out -> msg Log"}},{"id":"7d67a31b-9d28-4f0a-b727-bcf6d503cc05","source":{"id":"73063a26-ad89-432d-ae19-cfc706a6949d","port":"out"},"target":{"id":"20fd4de6-1ed7-4887-83d2-40951d765204","port":"in"},"metadata":{"title":"Commands out -> in PrepareCommand"}},{"id":"c8d6d09b-b7bf-427f-840b-87a793d39958","source":{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","port":"out"},"target":{"id":"e23e2939-6452-4809-8688-81d5e346d8b1","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"244393b8-cf67-41f9-8b5d-c8f21b3a2e0c","source":{"id":"e187f227-3b9f-4177-851d-1c69cc3cf015","port":"out"},"target":{"id":"fca2fe7b-346f-40c4-89e4-8808143e02d2","port":"in","setting":{"persist":true}},"metadata":{"title":"CommandsPicker out -> in PickSchema"}},{"id":"bce1911b-93b0-4476-82a8-36ddf225043a","source":{"id":"717f35f2-ea36-4480-9c62-0bbd84aee7e4","port":"out","setting":{"index":0}},"target":{"id":"fca2fe7b-346f-40c4-89e4-8808143e02d2","port":"path"},"metadata":{"title":"CommandKey out -> path PickSchema"}},{"id":"05c4e6ce-d269-43eb-8fb3-9473e336d634","source":{"id":"717f35f2-ea36-4480-9c62-0bbd84aee7e4","port":"out"},"target":{"id":"e23e2939-6452-4809-8688-81d5e346d8b1","port":"msg"},"metadata":{"title":"CommandKey out -> msg Log"}}],"title":"Modelling","ns":"models","name":"model","ports":{"input":{"command":{"nodeId":"717f35f2-ea36-4480-9c62-0bbd84aee7e4","title":"Command","name":"in"},"in":{"nodeId":"b702972c-9072-446d-adbc-c18fb7fd8294","title":"In","name":"in"}},"output":{"schema":{"nodeId":"fca2fe7b-346f-40c4-89e4-8808143e02d2","title":"Schema","name":"out"},"options":{"nodeId":"20fd4de6-1ed7-4887-83d2-40951d765204","title":"Options","name":"out"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graph/{ns}/{name}.fbp"}}},"./graph/{name}.fbp":{"protocol":{"message":{"id":"whatever","type":"flow","nodes":[{"id":"1d59c274-c206-4d4b-80a7-d1885febe018","title":"MessageEl","ns":"dom","name":"querySelector","context":{"selector":"#messages"}},{"id":"3591f49f-fa4b-4b81-97ee-2b744ff1ca8d","title":"View","ns":"template","name":"mustache","context":{"body":"<div class=\"message panel panel-info\">\n  <div class=\"panel-heading\">\n    <h3 class=\"panel-title\">{{title}}<button type=\"button\" class=\"close pull-right\" aria-label=\"Close\"><span aria-hidden=\"true\">&times;</span></button></h3>\n  </div>\n  <div class=\"panel-body\">\n     {{body}}\n  </div>\n</div>\n"}},{"id":"7b0e8d17-a208-4650-9a1e-11eaee90df3a","title":"Button","ns":"bootstrap","name":"button"},{"id":"04185549-7fbf-4e40-a98f-ef05fdb997f8","title":"Click","ns":"dom","name":"addMouseEvent","context":{"event":"click"}},{"id":"5537a9e7-4d02-4dfa-9a66-f21802f1892b","title":"AddMessage","ns":"dom","name":"appendChild"},{"id":"59d0911f-1926-444b-bb32-07b1a5e724f6","title":"ToHtml","ns":"dom","name":"domify"},{"id":"4f183f56-62f2-40f7-90da-49f210a37812","title":"Log","ns":"console","name":"log"},{"id":"9f317c59-3e6d-4b49-8b9c-35c1a169b08c","title":"d","ns":"utils","name":"dummy"}],"links":[{"id":"d9b2afea-1b8b-482c-b817-43ec580bda4f","source":{"id":"1d59c274-c206-4d4b-80a7-d1885febe018","port":"selection"},"target":{"id":"5537a9e7-4d02-4dfa-9a66-f21802f1892b","port":"element","setting":{"persist":true}},"metadata":{"title":"MessageEl selection -> element AddMessage"}},{"id":"56c5b906-5849-4e87-8d08-3d342b2ea577","source":{"id":"59d0911f-1926-444b-bb32-07b1a5e724f6","port":"out"},"target":{"id":"5537a9e7-4d02-4dfa-9a66-f21802f1892b","port":"child"},"metadata":{"title":"ToHtml out -> child AddMessage"}},{"id":"4714605e-f1e5-4179-9d43-f2c7ddf14777","source":{"id":"5537a9e7-4d02-4dfa-9a66-f21802f1892b","port":"element"},"target":{"id":"04185549-7fbf-4e40-a98f-ef05fdb997f8","port":"element"},"metadata":{"title":"AddMessage element -> element Click"}},{"id":"508d8095-5fe2-4013-9c6d-b17f574b4c24","source":{"id":"1d59c274-c206-4d4b-80a7-d1885febe018","port":"selection"},"target":{"id":"4f183f56-62f2-40f7-90da-49f210a37812","port":"msg"},"metadata":{"title":"MessageEl selection -> msg Log"}},{"id":"c000ce3e-245c-46cc-90b4-8489b0fd2dea","source":{"id":"9f317c59-3e6d-4b49-8b9c-35c1a169b08c","port":"out"},"target":{"id":"04185549-7fbf-4e40-a98f-ef05fdb997f8","port":"in"},"metadata":{"title":"d out -> in Click"}},{"id":"7b7293bd-1d91-437f-8f1e-bd0731bdc168","source":{"id":"3591f49f-fa4b-4b81-97ee-2b744ff1ca8d","port":"out"},"target":{"id":"59d0911f-1926-444b-bb32-07b1a5e724f6","port":"in"},"metadata":{"title":"View out -> in ToHtml"}}],"title":"Message Box","ns":"protocol","name":"message","ports":{"input":{"in":{"nodeId":"9f317c59-3e6d-4b49-8b9c-35c1a169b08c","title":"In","name":"in"},"vars":{"nodeId":"3591f49f-fa4b-4b81-97ee-2b744ff1ca8d","title":"Vars","name":"vars"}},"output":{"out":{"nodeId":"04185549-7fbf-4e40-a98f-ef05fdb997f8","title":"Out","name":"out"},"event":{"nodeId":"04185549-7fbf-4e40-a98f-ef05fdb997f8","title":"Event","name":"event"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graph/{name}.fbp"}}},"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"dom":{"querySelector":{"_id":"527299bb30b8af4b8910216b","name":"querySelector","ns":"dom","title":"querySelector","description":"[Document query selector](https://developer.mozilla.org/en-US/docs/Web/API/document.querySelector)","expose":["document"],"phrases":{"active":"Gathering elements matching criteria: {{input.selector}}"},"ports":{"input":{"element":{"title":"Element","type":"HTMLElement","default":null},"selector":{"title":"Selector","type":"string"}},"output":{"element":{"title":"Element","type":"HTMLElement"},"selection":{"title":"Selection","type":"HTMLElement"},"error":{"title":"Error","type":"Error"}}},"fn":"var el = input.element ? input.element : document;\noutput = {\n  element: el\n};\n\nvar selection = el.querySelector(input.selector);\nif(selection) {\n  output.selection = selection;\n} else {\n  output.error = Error('Selector ' + input.selector + ' did not match');\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"setHtml":{"_id":"52be32d46a14bb6fbd924a24","name":"setHtml","ns":"dom","description":"dom setHtml","async":true,"phrases":{"active":"Adding html"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"html":{"type":"string","format":"html","title":"html","async":true}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"}}},"fn":"on.input.html = function(data) {\n  input.element.innerHTML = data;\n  output({ element: input.element });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"addMouseEvent":{"_id":"52be4f096a14bb6fbd924a28","name":"addMouseEvent","ns":"dom","description":"Add Mouse Event Listener","async":true,"phrases":{"active":"Adding {{input.event}} handler"},"ports":{"input":{"in":{"title":"Input","type":"any","async":true,"default":null},"element":{"type":"HTMLElement","title":"Dom Element","async":true},"preventDefault":{"type":"boolean","title":"Prevent Default Event","default":true},"event":{"type":"string","enum":["click","dblclick","mousedown","mouseup","mouseover","mousemove","mouseout","dragstart","drag","dragenter","dragleave","dragover","drop","dragend"],"title":"Dom Event"}},"output":{"element":{"type":"any","title":"Element"},"out":{"type":"any","title":"Output"},"event":{"type":"object","title":"Event"}}},"fn":"state.in = null;\nstate.event = null;\nstate.preventDefault = null;\n\nstate.clickHandler = function(ev) {\n  if(state.preventDefault) ev.preventDefault();\n  output({\n    out: state.in,\n    event: ev\n  });\n};\n\non.input.in = function() {\n  state.in = data;\n};\n\non.input.element = function() {\n\n  if (!state.in) return false;\n\n  if(state.el) {\n    state.el.removeEventListener(state.event);\n  }\n  state.el = input.element;\n  state.event = input.event;\n  state.preventDefault = input.preventDefault;\n\n  state.el.addEventListener(input.event, state.clickHandler, false);\n  output({element: input.element});\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"appendChild":{"_id":"52be32d46a14bb6fbd924a20","name":"appendChild","ns":"dom","description":"dom appendChild","async":true,"phrases":{"active":"Adding child node"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"child":{"type":"HTMLElement","async":true,"title":"Child Element"}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"},"out":{"type":"object"}}},"fn":"on.input.child = function() {\n\n  output( {\n    element: input.element,\n    out: input.element.appendChild(data)\n  } );\n\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"domify":{"_id":"530556db041b29b9e16b1d1f","name":"domify","ns":"dom","title":"Domify","description":"Turn HTML into DOM elements x-browser","phrases":{"active":"Domifying HTML"},"ports":{"input":{"in":{"title":"Html","type":"string","format":"html","required":"true"}},"output":{"out":{"title":"Dom Elements","type":["HTMLElement","DocumentFragment"]}}},"dependencies":{"npm":{"domify":"0.x.x"}},"fn":"output.out = domify(input.in);\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"bootstrap":{"select":{"_id":"54b74927fa15e75e679fd19c","name":"select","ns":"bootstrap","title":"Select","description":"Bootstrap - select","async":true,"dependencies":{"npm":{"mustache":"latest","domify":"latest"}},"ports":{"input":{"element":{"type":"HTMLElement","title":"Parent Element","async":true},"template":{"title":"Template","type":"string","default":"<div>{{#label}}<label>{{label}}</label>{{/label}}<select id=\"{{id}}\" class=\"form-control\">{{#options}}<option value=\"{{value}}\">{{label}}</option>{{/options}}</select></div>","format":"html"},"id":{"type":"string","title":"ID","default":""},"label":{"type":"string","title":"Label","default":""},"options":{"title":"Variables","type":"array","items":{"type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"},"additionalProperties":false}}}},"output":{"element":{"title":"Element","type":"HTMLFragment"},"out":{"title":"Value","type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"}}}}},"fn":"state.select = null;\nstate.view = {};\nstate.changed = function () {\n\n  var out = {};\n  var self = this;\n\n  out[this.value] = state.view.options.filter(function(opt) {\n    return opt.value === self.value;\n  }).pop();\n\n  output({out: out});\n};\n\non.input.element = function () {\n\n  if (state.select) {\n    state.select.removeEventListener('change', state.changed);\n    input.element.innerHTML = null;\n  }\n\n  state.view = {\n    id: input.id,\n    label: input.label,\n    options: input.options\n  };\n\n  var el = domify(mustache.render(input.template, state.view));\n\n  input.element.appendChild(el);\n\n  state.select = input.element.querySelector('select');\n  state.select.addEventListener('change', state.changed);\n\n  output({\n    element: input.element\n  });\n\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"button":{"_id":"54bc6765fa15e75e679fd1ac","name":"button","ns":"bootstrap","title":"Button","description":"Bootstrap - button","async":true,"ports":{"input":{"element":{"title":"Parent Element","type":"HTMLElement","async":true},"classList":{"title":"Class list","type":"string","default":"btn btn-default"},"in":{"type":"any","description":"Input to send to output when clicked","title":"Input","async":true},"label":{"type":"string","title":"Label","default":"Click!"},"attr":{"title":"Attributes","type":"object","default":{}}},"output":{"element":{"title":"Element","type":"HTMLElement"},"error":{"title":"Error","type":"Error"},"event":{"title":"Event","type":"object"},"out":{"title":"Output","type":"any"}}},"fn":"state.el = null;\nstate.clickHandler = function(ev) {\n  output({\n    event: ev,\n    out: state.in\n  });\n};\n\non.input.element = function() {\n  if (state.el) {\n    state.el.removeEventListener('click', state.clickHandler);\n    state.el.innerHTML = null;\n  }\n  state.el = document.createElement('button');\n  state.el.setAttribute('type', 'button');\n  state.el.innerHTML = input.label;\n  state.el.className = input.classList;\n  Object.keys(input.attr).forEach(function(name) {\n    state.el.setAttribute(name, input.attr[name]);\n  });\n  state.el.addEventListener('click', state.clickHandler);\n  input.element.appendChild(state.el);\n  output({\n    element: input.element\n  });\n};\n\non.input.in = function () {\n  state.in = data;\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"json-editor":{"editor":{"_id":"54b36348b314b122580582fa","name":"editor","ns":"json-editor","title":"JSON Editor","description":"JSON Editor","async":true,"phrases":{"active":"Creating JSON Editor"},"dependencies":{"npm":{"json-editor":"latest"}},"ports":{"input":{"element":{"title":"Element","description":"Element","type":"HTMLElement"},"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"schema":{"title":"Schema","type":"object","description":"A valid JSON Schema to use for the editor. Version 3 and Version 4 of the draft specification are supported.","async":true},"enable":{"title":"Enable","description":"Enable","async":true},"disable":{"title":"Disable","description":"Disable","async":true},"options":{"title":"Options","type":"object","properties":{"ajax":{"title":"Ajax","description":"If true, JSON Editor will load external URLs in $ref via ajax.","default":false},"disable_array_add":{"title":"Disable array add","description":"If true, remove all `add row` buttons from arrays.","default":false},"disable_array_delete":{"title":"Disable array delete","description":"If true, remove all `delete row` buttons from arrays.","default":false},"disable_array_reorder":{"title":"Disable array reorder","description":"If true, remove all `move up` and `move down` buttons from arrays.","default":false},"disable_collapse":{"title":"Disable collapse","description":"If true, remove all collapse buttons from objects and arrays.","default":false},"disable_edit_json":{"title":"Disable edit json","description":"If true, remove all Edit JSON buttons from objects.","default":false},"disable_properties":{"title":"Disable properties","description":"If true, remove all Edit Properties buttons from objects.","default":false},"form_name_root":{"title":"Form name root","description":"The first part of the `name` attribute of form inputs in the editor. An full example name is `root[person][name]` where `root` is the form_name_root.","default":"root"},"iconlib":{"title":"Iconlib","description":"The icon library to use for the editor. See the CSS Integration section below for more info.","default":null},"no_additional_properties":{"title":"No additional properties","description":"If true, objects can only contain properties defined with the properties keyword.","default":false},"refs":{"title":"Refs","description":"An object containing schema definitions for URLs. Allows you to pre-define external schemas.","default":{}},"required_by_default":{"title":"Required by default","description":"If true, all schemas that don't explicitly set the required property will be required.","default":false},"show_errors":{"title":"Show errors","description":"When to show validation errors in the UI. Valid values are interaction, change, always, and never.","default":"interaction"},"startval":{"title":"Start value","description":" Seed the editor with an initial value. This should be valid against the editor's schema.","default":null},"template":{"title":"Template","description":"The JS template engine to use. See the Templates and Variables section below for more info.","default":"default"},"theme":{"title":"Theme","description":"The CSS theme to use. See the CSS Integration section below for more info.","default":"html"}}}},"output":{"out":{"title":"out","type":"string"},"editor":{"title":"Editor","type":"JSONEditor"}}},"fn":"state.jsonEditor = null;\nstate.changeHandler = function() {\n    output({out: state.jsonEditor.getValue()});\n};\n\non.input.in = function() {\n  state.in = data;\n  if (state.jsonEditor) {\n    state.jsonEditor.setValue(state.in);\n  }\n};\n\non.input.schema = function() {\n  state.schema = input.options.schema = input.schema;\n  if (state.jsonEditor) {\n    state.jsonEditor.off('change', state.changeHandler);\n    state.jsonEditor.destroy();\n  }\n  state.jsonEditor = new json_editor(input.element, input.options);\n  // problem if state.in is not about this schema..\n  state.jsonEditor.on('ready', function() {\n    if (state.in) {\n      state.jsonEditor.setValue(state.in);\n    }\n    state.jsonEditor.on('change', state.changeHandler);\n    output({editor: state.jsonEditor});\n  });\n};\n\non.input.enable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.enable();\n  }\n};\n\non.input.disable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.disable();\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"validate":{"_id":"54bc6c5cfa15e75e679fd1ad","name":"validate","ns":"json-editor","title":"JSON Editor Validate","description":"JSON Editor Validate","async":true,"phrases":{"active":"Validating form"},"ports":{"input":{"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"editor":{"title":"Editor","type":"function","description":"JSONEditor instance"}},"output":{"out":{"title":"Output","type":"string"},"errors":{"title":"Errors","type":"array","items":{"type":"object","properties":{"path":{"title":"Path","description":"a dot separated path into the JSON object (e.g. `root.path.to.field`)","type":"string"},"property":{"title":"Property","description":"schema keyword that triggered the validation error (e.g. `minLength`)","type":"string"},"message":{"title":"Message","type":"string"}}}}}},"fn":"on.input.in = function() {\n  var errors = input.editor.validate(data);\n  if(errors.length) {\n    output({errors: errors});\n  } else {\n    output({out: data});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"object":{"keys":{"_id":"52ef3630cf8e1bab142d5394","name":"keys","ns":"object","async":true,"description":"Retrieve all the names of the object's properties","phrases":{"active":"Retrieving object properties"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true},"path":{"title":"Path","type":"string","default":null}},"output":{"out":{"title":"out","type":"array"}}},"dependencies":{"npm":{"underscore":"1.x.x","dot-object":"0.x.x"}},"fn":"on.input.in = function() {\n  var val = input.path ? dot_object().pick(input.path, data) : data;\n  output( { out: underscore.keys(val) } );\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"create":{"_id":"52fa908e909495ebbe6ded4c","name":"create","ns":"object","async":true,"description":"Create an object, if input is a direct object it just returns a copy of the object","phrases":{"active":"Creating object"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true}},"output":{"out":{"title":"out","type":"object"}}},"fn":"on.input.in = function(data) { output({out: data}); };\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"data":{"pick":{"_id":"527d857e83f0adcc47800e7c","name":"pick","ns":"data","title":"Pick","async":true,"description":"Pick one value from an object","phrases":{"active":"Picking {{input.path}} from object"},"ports":{"input":{"in":{"title":"Object","description":"An Object, e.g { name: { first: 'John', last: 'Doe' } }","type":"object","async":true},"path":{"title":"Path","description":"Specify a path with . syntax (e.g. name.last )","type":"string","required":true}},"output":{"out":{"title":"Output","type":"any"},"error":{"title":"Error","type":"Error"}}},"dependencies":{"npm":{"dot-object":"0.x.x"}},"fn":"on.input.in = function(data) {\n  // dot_object api should be fixed..\n  var res = dot_object().pick(input.path, data);\n  if(typeof res !== 'undefined') {\n    output({out: res});\n  } else {\n    output({error: Error(input.path + ' not found')});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"string":{"append":{"_id":"52ef363bcf8e1bab142d53b7","name":"append","ns":"string","description":"Appends a string to an other string","phrases":{"active":"Appending string"},"ports":{"input":{"in":{"title":"String","type":"string","required":true},"append":{"title":"Other String","type":"string","required":true}},"output":{"out":{"title":"String","type":"string"}}},"fn":"output.out = input.in + input.append\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"array":{"map":{"_id":"54b8835afa15e75e679fd19d","name":"map","ns":"array","async":true,"description":"Creates new array output with the results of calling the provided function on every element in this array","phrases":{"active":"Mapping array"},"ports":{"input":{"in":{"title":"Value","type":"array","async":true},"fn":{"title":"Function","type":"function","args":["val","index","array"]}},"output":{"out":{"title":"Output","type":"array"}}},"fn":"on.input.in = function() {\n  output({\n    out: data.map(input.fn)\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"template":{"mustache":{"_id":"52645993df5da0102500005e","name":"mustache","ns":"template","description":"Mustache Template engine","phrases":{"active":"Compiling mustache template"},"ports":{"input":{"body":{"type":"string","format":"html","title":"Template body","description":"The body of the mustache template","required":true},"vars":{"type":"object","title":"Input variables","description":"the input variables for this template","required":true,"readonly":true}},"output":{"out":{"title":"String","type":"string"}}},"dependencies":{"npm":{"mustache":"latest"}},"fn":"output = {\n  out: mustache.render(input.body, input.vars)\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"utils":{"dummy":{"_id":"52ef363dcf8e1bab142d53bb","name":"dummy","ns":"utils","title":"Dummy","description":"Takes an input and passes it to output.","phrases":{"active":"Dummy"},"ports":{"input":{"in":{"type":"any","title":"Input"}},"output":{"out":{"type":"any","title":"Output"}}},"fn":"output.out = input. in\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
+  this.nodeDefinitions = {"./graphs/{ns}/{name}.fbp":{"models":{"model":{"id":"MyModel","type":"flow","nodes":[{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","title":"Commands","ns":"object","name":"keys"},{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","title":"CommandsPicker","ns":"data","name":"pick"},{"id":"fb7799df-0093-421b-97c0-88cb6e18047f","title":"ProtocolSchemas","ns":"object","name":"create","context":{"in":{"network":{"title":"Network protocol","description":"Protocol for starting and stopping FBP networks, and finding out about their state.","output":{"stopped":{"title":"Stopped","description":"Inform that a given network has stopped.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was stopped"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"time the network was running, in seconds"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"started":{"title":"Started","description":"Inform that a given network has been started.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was started"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"status":{"title":"Status","description":"Response to a getstatus message.","type":"object","properties":{"running":{"title":"Running","type":"boolean","description":"boolean tells whether the network is running or not"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"(optional) time the network has been running, in seconds"}}},"output":{"description":"An output message from a running network, roughly similar to STDOUT output of a Unix process, or a line of console.log in JavaScript. Output can also be used for passing images from the runtime to the UI.","properties":{"message":{"type":"string","description":"contents of the output line"},"type":{"type":"string","enum":["message","previewurl"],"description":"(optional) type of output, either message or previewurl"},"url":{"type":"string","format":"uri","description":"(optional) URL for an image generated by the runtime"}}},"error":{"description":"An error from a running network, roughly similar to STDERR output of a Unix process, or a line of console.error in JavaScript.","properties":{"message":{"type":"any","description":"contents of the error message"}}},"icon":{"description":"Icon of a component instance has changed.","properties":{"id":{"type":"string","description":"identifier of the node"},"icon":{"type":"string","description":"new icon for the component instance"},"graph":{"type":"string","description":"graph the action targets"}}},"connect":{"description":"Beginning of transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"begingroup":{"description":"Beginning of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"data":{"description":"Data transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"data":{"type":"any","description":"actual data being transmitted, encoded in a way that can be carried over the protocol transport"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"endgroup":{"description":"Ending of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"description":"graph the action targets","type":"string"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"disconnect":{"description":"End of transmission on an edge.","properties":{"id":{"description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}}},"input":{"error":{"description":"Network error"},"start":{"description":"Start execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"getstatus":{"description":"Get the current status of the runtime. The runtime should respond with a status message.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"stop":{"description":"Stop execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"edges":{"description":"List of edges user has selected for inspection in a user interface or debugger, sent from UI to a runtime.","edges":{"type":"array","description":"list of selected edges, each containing","properties":{"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"},"graph":{"type":"string","description":"graph the action targets"}}}}}}}},"component":{"title":"Component protocol","description":"Protocol for handling the component registry.","output":{"error":{"description":"Component error"},"component":{"title":"Component","description":"Transmit the metadata about a component instance.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"component name in format that can be used in graphs"},"description":{"title":"Description","type":"string","description":"(optional) textual description on what the component does"},"icon":{"title":"Icon","type":"string","description":"(optional): visual icon for the component, matching icon names in [Font Awesome](http://fortawesome.github.io/Font-Awesome/icons/)"},"subgraph":{"title":"Subgraph","type":"boolean","description":"boolean telling whether the component is a subgraph"},"inPorts":{"title":"Input Ports","description":"list of input ports, each containing:","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"values":{"title":"Values","type":"array","description":"(optional) array of the values that the port accepts for enum ports"},"default":{"title":"Default","type":"any","description":"(optional) the default value received by the port"}}},"outPorts":{"description":"list of output ports","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"}}}}},"source":{"description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}},"input":{"error":{"title":"Error","description":"Component error","type":"object"},"list":{"title":"List","description":"Request a list of currently available components. Will be responded with a set of `component` messages.","type":"object"},"getsource":{"title":"Get Source","description":"Request for the source code of a given component. Will be responded with a `source` message.","type":"object","properties":{"name":{"type":"string","description":"Name of the component to get source code for"}}},"source":{"title":"Source code","description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}}},"runtime":{"title":"Runtime protocol","description":"When a client connects to a FBP procotol it may choose to discover the capabilities and other information about the runtime.","input":{"error":{"title":"Error","description":"Runtime error","type":"object"},"getruntime":{"title":"Get runtime","description":"Request the information about the runtime. When receiving this message the runtime should response with a runtime message.","type":"object"},"packet":{"title":"Packet","description":"Runtimes that can be used as remote subgraphs (i.e. ones that have reported supporting the protocol:runtime capability) need to be able to receive and transmit information packets at their exposed ports.\nThese packets can be send from the client to the runtime's input ports, or from runtime's output ports to the client.","type":"object","properties":{"port":{"title":"Port","type":"string","description":"port name for the input or output port"},"event":{"title":"Event","type":"string","enum":["connect","begingroup","data","endgroup","disconnect"],"description":"packet event"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"payload":{"title":"Payload","type":"object","description":"(optional) payload for the packet. Used only with begingroup (for group names) and data packets"}}}},"output":{"error":{"title":"Error","description":"Runtime error","type":"object"},"ports":{"title":"Ports","description":"Message sent by the runtime to signal its available ports. The runtime is responsible for sending the up-to-date list of available ports back to client whenever it changes.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"ID of the currently configured main graph running on the runtime"},"inPorts":{"title":"Input ports","description":"list of input ports","type":"array","items":{"type":"object","properties":{"addressable":{"title":"addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","description":"port datatype, for example boolean","type":"string"},"required":{"title":"Required","description":"boolean telling whether the port needs to be connected for the component to work","type":"boolean"},"description":{"title":"Description","type":"string","description":"textual description of the port"}}}},"outPorts":{"title":"Output ports","description":"list of output ports","type":"array","items":{"type":"object","properties":{"description":{"type":"string","description":"textual description of the port"},"required":{"type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"type":{"description":"port datatype, for example boolean","type":"string"},"id":{"description":"port name","type":"string"},"addressable":{"description":"boolean telling whether the port is an ArrayPort","type":"boolean"}}}}}},"runtime":{"title":"Runtime","description":"Response from the runtime to the getruntime request.","type":"object","properties":{"id":{"title":"ID","type":"string","required":false,"description":"(optional) runtime ID used with Flowhub Registry"},"label":{"title":"Label","description":"(optional) Human-readable description of the runtime","type":"string","required":false},"version":{"title":"Version","description":"version of the runtime protocol that the runtime supports, for example 0.4","type":"string"},"capabilities":{"title":"Capabilities","type":"array","items":{"protocol:network":{"description":"the runtime is able to control and introspect its running networks using the Network protocol"},"protocol:component":{"description":"the runtime is able to list and modify its components using the Component protocol"},"protocol:runtime":{"description":"the runtime is able to expose the ports of its main graph using the Runtime protocol and transmit packet information to/from them"},"component:getsource":{"description":"runtime is able to read and send component source code back to client"},"network:persist":{"description":"runtime is able to *flash* a running graph setup into itself, making it persistent across reboots"},"protocol:graph":{"description":"the runtime is able to modify its graphs using the Graph protocol"},"component:setsource":{"description":"runtime is able to compile and run custom components sent as source code strings"}},"description":"array of capability strings for things the runtime is able to do\nIf the runtime is currently running a graph and it is able to speak the full Runtime protocol, it should follow up with a ports message."},"graph":{"title":"Graph","description":"(optional) ID of the currently configured main graph running on the runtime, if any","type":"string","required":false},"type":{"title":"Type","description":"type of the runtime, for example noflo-nodejs or microflo","type":"string"}}}}},"graph":{"title":"Graph protocol","description":"This protocol is utilized for communicating about graph changes in both directions.","output":{"error":{"description":"Graph error","type":"object"},"addnode":{"description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":"string","description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}}},"input":{"error":{"title":"Error","description":"Graph error","type":"object"},"clear":{"title":"Clear","description":"Initialize an empty graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the graph being created. Used for all subsequent messages related to the graph instance","required":true},"name":{"title":"Name","type":"string","description":"(optional) Human-readable label for the graph"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"main":{"title":"Main","type":"boolean","description":"(optional) Identifies the graph as a main graph of a project that should not be registered as a component\nGraphs registered in this way should also be available for use as subgraphs in other graphs. Therefore a graph registration and later changes to it may cause component messages of the Component protocol to be sent back to the client informing of possible changes in the ports of the subgraph component."}}},"subscribe":{"title":"Subscribe","description":"Subscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to subscribe to","required":true}}},"unsubscribe":{"title":"Unsubscribe","description":"Unsubscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to unsubscribe from","required":true}}},"addnode":{"title":"Add node","description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"title":"Removenode","description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"title":"Rename node","description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"title":"Add edge","description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","description":"graph the action targets"}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"titile":"Graph","type":"string","description":"graph the action targets"},"src":{"titile":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"Rename inport","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}}}}}}},{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","title":"Log","ns":"console","name":"log"},{"id":"29b2b735-6c09-46f0-b5ce-50fe50780d16","title":"CommandKey","ns":"object","name":"keys"},{"id":"4508d067-b1b5-486e-b40f-5d7697bdcf59","title":"GetCommands","ns":"object","name":"keys"},{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","title":"BuildPath","ns":"string","name":"append","context":{"append":".input"}},{"id":"51c477d0-5ef7-4961-8e86-688ed2d00087","title":"PrepareCommand","ns":"array","name":"map","context":{"fn":"\n return {\n   label: val,\n   value: val\n }\n"}},{"id":"977581af-7a9c-4775-9f18-20029698c1d8","title":"PickSchema","ns":"data","name":"pick"}],"links":[{"id":"a2d30485-a7ad-4b4f-a5e1-c6e439e6f23c","source":{"id":"4508d067-b1b5-486e-b40f-5d7697bdcf59","port":"out","setting":{"index":0}},"target":{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","port":"in"},"metadata":{"title":"GetCommands out -> in BuildPath"}},{"id":"a7caa285-adda-4c25-90fb-5afbfa486df6","source":{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","port":"out"},"target":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"path"},"metadata":{"title":"BuildPath out -> path CommandsPicker"}},{"id":"c51bb694-5e34-4795-9621-efa017b14497","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"c0e7447e-114d-48af-8c7e-e021055ab078","source":{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"BuildPath out -> msg Log"}},{"id":"dc0beeba-3aea-46c5-a85b-0962db74a557","source":{"id":"fb7799df-0093-421b-97c0-88cb6e18047f","port":"out"},"target":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"in","setting":{"persist":true}},"metadata":{"title":"ProtocolSchemas out -> in CommandsPicker"}},{"id":"c2efd600-42c8-4121-824f-acf5194735dc","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","port":"in"},"metadata":{"title":"CommandsPicker out -> in Commands"}},{"id":"4e22181b-62a0-46da-930c-9cccb0e4cc76","source":{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"Commands out -> msg Log"}},{"id":"84a42273-d0f0-434d-aafc-d11ba7ff5bbe","source":{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","port":"out"},"target":{"id":"51c477d0-5ef7-4961-8e86-688ed2d00087","port":"in"},"metadata":{"title":"Commands out -> in PrepareCommand"}},{"id":"9350f023-283f-4991-8963-038d76ed8aba","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"e41d7d03-ef37-4d41-8aa9-b210ce354b5b","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"977581af-7a9c-4775-9f18-20029698c1d8","port":"in","setting":{"persist":true}},"metadata":{"title":"CommandsPicker out -> in PickSchema"}},{"id":"5766d78b-96c3-469e-83f4-aafa5e262cbc","source":{"id":"29b2b735-6c09-46f0-b5ce-50fe50780d16","port":"out","setting":{"index":0}},"target":{"id":"977581af-7a9c-4775-9f18-20029698c1d8","port":"path"},"metadata":{"title":"CommandKey out -> path PickSchema"}},{"id":"52d41b3b-e1a8-4437-8eb5-36c5cc871b69","source":{"id":"29b2b735-6c09-46f0-b5ce-50fe50780d16","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"CommandKey out -> msg Log"}}],"title":"Modelling","ns":"models","name":"model","ports":{"input":{"command":{"nodeId":"29b2b735-6c09-46f0-b5ce-50fe50780d16","title":"Command","name":"in"},"in":{"nodeId":"4508d067-b1b5-486e-b40f-5d7697bdcf59","title":"In","name":"in"}},"output":{"schema":{"nodeId":"977581af-7a9c-4775-9f18-20029698c1d8","title":"Schema","name":"out"},"options":{"nodeId":"51c477d0-5ef7-4961-8e86-688ed2d00087","title":"Options","name":"out"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graphs/{ns}/{name}.fbp"}}},"./graphs/{name}.fbp":{"protocol":{"message":{"id":"MessageBox","type":"flow","nodes":[{"id":"7d5d06ba-a7c4-400d-b498-f1718681b722","title":"MessageEl","ns":"dom","name":"querySelector","context":{"selector":"#messages"}},{"id":"27099ae3-38ed-4b14-a713-9ba6da88c82b","title":"View","ns":"template","name":"mustache","context":{"body":"<div class=\"message panel panel-info\">\n  <div class=\"panel-heading\">\n    <h3 class=\"panel-title\">{{title}}<button type=\"button\" class=\"close pull-right\" aria-label=\"Close\"><span aria-hidden=\"true\">&times;</span></button></h3>\n  </div>\n  <div class=\"panel-body\">\n     {{body}}\n  </div>\n</div>\n"}},{"id":"a1180477-f906-43b0-90d4-d1934d80f0da","title":"Button","ns":"bootstrap","name":"button"},{"id":"b313bd79-bd62-4169-9b4a-427558998bd6","title":"Click","ns":"dom","name":"addMouseEvent","context":{"event":"click"}},{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","title":"AddMessage","ns":"dom","name":"appendChild"},{"id":"34af3ec0-c377-4931-9cbe-7266be031f25","title":"ToHtml","ns":"dom","name":"domify"},{"id":"7ee06e9c-2f18-40d5-8c02-5b5fef25197e","title":"Log","ns":"console","name":"log"},{"id":"9b96e5ec-f49d-43b4-897c-c8de6c15468f","title":"d","ns":"utils","name":"dummy"}],"links":[{"id":"9ee00908-66e9-43fb-8271-687e70c3ccab","source":{"id":"7d5d06ba-a7c4-400d-b498-f1718681b722","port":"selection"},"target":{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","port":"element","setting":{"persist":true}},"metadata":{"title":"MessageEl selection -> element AddMessage"}},{"id":"e1291f42-c0f9-4ce3-9753-a27132f3ab62","source":{"id":"34af3ec0-c377-4931-9cbe-7266be031f25","port":"out"},"target":{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","port":"child"},"metadata":{"title":"ToHtml out -> child AddMessage"}},{"id":"fe4c31ea-adf1-45cd-bdf1-dbeaa642cf32","source":{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","port":"element"},"target":{"id":"b313bd79-bd62-4169-9b4a-427558998bd6","port":"element"},"metadata":{"title":"AddMessage element -> element Click"}},{"id":"08aa4c24-ca24-4adb-b35d-553c74ca868c","source":{"id":"7d5d06ba-a7c4-400d-b498-f1718681b722","port":"selection"},"target":{"id":"7ee06e9c-2f18-40d5-8c02-5b5fef25197e","port":"msg"},"metadata":{"title":"MessageEl selection -> msg Log"}},{"id":"8250aba7-a91d-4629-baf0-419fbc2734b5","source":{"id":"9b96e5ec-f49d-43b4-897c-c8de6c15468f","port":"out"},"target":{"id":"b313bd79-bd62-4169-9b4a-427558998bd6","port":"in"},"metadata":{"title":"d out -> in Click"}},{"id":"106f8dcd-7371-4ca3-8228-120bfb347259","source":{"id":"27099ae3-38ed-4b14-a713-9ba6da88c82b","port":"out"},"target":{"id":"34af3ec0-c377-4931-9cbe-7266be031f25","port":"in"},"metadata":{"title":"View out -> in ToHtml"}}],"title":"Message Box","ns":"protocol","name":"message","ports":{"input":{"in":{"nodeId":"9b96e5ec-f49d-43b4-897c-c8de6c15468f","title":"In","name":"in"},"vars":{"nodeId":"27099ae3-38ed-4b14-a713-9ba6da88c82b","title":"Vars","name":"vars"}},"output":{"out":{"nodeId":"b313bd79-bd62-4169-9b4a-427558998bd6","title":"Out","name":"out"},"event":{"nodeId":"b313bd79-bd62-4169-9b4a-427558998bd6","title":"Event","name":"event"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graphs/{name}.fbp"}}},"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"dom":{"querySelector":{"_id":"527299bb30b8af4b8910216b","name":"querySelector","ns":"dom","title":"querySelector","description":"[Document query selector](https://developer.mozilla.org/en-US/docs/Web/API/document.querySelector)","expose":["document"],"phrases":{"active":"Gathering elements matching criteria: {{input.selector}}"},"ports":{"input":{"element":{"title":"Element","type":"HTMLElement","default":null},"selector":{"title":"Selector","type":"string"}},"output":{"element":{"title":"Element","type":"HTMLElement"},"selection":{"title":"Selection","type":"HTMLElement"},"error":{"title":"Error","type":"Error"}}},"fn":"var el = input.element ? input.element : document;\noutput = {\n  element: el\n};\n\nvar selection = el.querySelector(input.selector);\nif(selection) {\n  output.selection = selection;\n} else {\n  output.error = Error('Selector ' + input.selector + ' did not match');\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"setHtml":{"_id":"52be32d46a14bb6fbd924a24","name":"setHtml","ns":"dom","description":"dom setHtml","async":true,"phrases":{"active":"Adding html"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"html":{"type":"string","format":"html","title":"html","async":true}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"}}},"fn":"on.input.html = function(data) {\n  input.element.innerHTML = data;\n  output({ element: input.element });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"addMouseEvent":{"_id":"52be4f096a14bb6fbd924a28","name":"addMouseEvent","ns":"dom","description":"Add Mouse Event Listener","async":true,"phrases":{"active":"Adding {{input.event}} handler"},"ports":{"input":{"in":{"title":"Input","type":"any","async":true,"default":null},"element":{"type":"HTMLElement","title":"Dom Element","async":true},"preventDefault":{"type":"boolean","title":"Prevent Default Event","default":true},"event":{"type":"string","enum":["click","dblclick","mousedown","mouseup","mouseover","mousemove","mouseout","dragstart","drag","dragenter","dragleave","dragover","drop","dragend"],"title":"Dom Event"}},"output":{"element":{"type":"any","title":"Element"},"out":{"type":"any","title":"Output"},"event":{"type":"object","title":"Event"}}},"fn":"state.in = null;\nstate.event = null;\nstate.preventDefault = null;\n\nstate.clickHandler = function(ev) {\n  if(state.preventDefault) ev.preventDefault();\n  output({\n    out: state.in,\n    event: ev\n  });\n};\n\non.input.in = function() {\n  state.in = data;\n};\n\non.input.element = function() {\n\n  if (!state.in) return false;\n\n  if(state.el) {\n    state.el.removeEventListener(state.event);\n  }\n  state.el = input.element;\n  state.event = input.event;\n  state.preventDefault = input.preventDefault;\n\n  state.el.addEventListener(input.event, state.clickHandler, false);\n  output({element: input.element});\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"appendChild":{"_id":"52be32d46a14bb6fbd924a20","name":"appendChild","ns":"dom","description":"dom appendChild","async":true,"phrases":{"active":"Adding child node"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"child":{"type":"HTMLElement","async":true,"title":"Child Element"}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"},"out":{"type":"object"}}},"fn":"on.input.child = function() {\n\n  output( {\n    element: input.element,\n    out: input.element.appendChild(data)\n  } );\n\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"domify":{"_id":"530556db041b29b9e16b1d1f","name":"domify","ns":"dom","title":"Domify","description":"Turn HTML into DOM elements x-browser","phrases":{"active":"Domifying HTML"},"ports":{"input":{"in":{"title":"Html","type":"string","format":"html","required":"true"}},"output":{"out":{"title":"Dom Elements","type":["HTMLElement","DocumentFragment"]}}},"dependencies":{"npm":{"domify":"0.x.x"}},"fn":"output.out = domify(input.in);\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"bootstrap":{"select":{"_id":"54b74927fa15e75e679fd19c","name":"select","ns":"bootstrap","title":"Select","description":"Bootstrap - select","async":true,"dependencies":{"npm":{"mustache":"latest","domify":"latest"}},"ports":{"input":{"element":{"type":"HTMLElement","title":"Parent Element","async":true},"template":{"title":"Template","type":"string","default":"<div>{{#label}}<label>{{label}}</label>{{/label}}<select id=\"{{id}}\" class=\"form-control\">{{#options}}<option value=\"{{value}}\">{{label}}</option>{{/options}}</select></div>","format":"html"},"id":{"type":"string","title":"ID","default":""},"label":{"type":"string","title":"Label","default":""},"options":{"title":"Variables","type":"array","items":{"type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"},"additionalProperties":false}}}},"output":{"element":{"title":"Element","type":"HTMLFragment"},"out":{"title":"Value","type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"}}}}},"fn":"state.select = null;\nstate.view = {};\nstate.changed = function () {\n\n  var out = {};\n  var self = this;\n\n  out[this.value] = state.view.options.filter(function(opt) {\n    return opt.value === self.value;\n  }).pop();\n\n  output({out: out});\n};\n\non.input.element = function () {\n\n  if (state.select) {\n    state.select.removeEventListener('change', state.changed);\n    input.element.innerHTML = null;\n  }\n\n  state.view = {\n    id: input.id,\n    label: input.label,\n    options: input.options\n  };\n\n  var el = domify(mustache.render(input.template, state.view));\n\n  input.element.appendChild(el);\n\n  state.select = input.element.querySelector('select');\n  state.select.addEventListener('change', state.changed);\n\n  output({\n    element: input.element\n  });\n\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"button":{"_id":"54bc6765fa15e75e679fd1ac","name":"button","ns":"bootstrap","title":"Button","description":"Bootstrap - button","async":true,"ports":{"input":{"element":{"title":"Parent Element","type":"HTMLElement","async":true},"classList":{"title":"Class list","type":"string","default":"btn btn-default"},"in":{"type":"any","description":"Input to send to output when clicked","title":"Input","async":true},"label":{"type":"string","title":"Label","default":"Click!"},"attr":{"title":"Attributes","type":"object","default":{}}},"output":{"element":{"title":"Element","type":"HTMLElement"},"error":{"title":"Error","type":"Error"},"event":{"title":"Event","type":"object"},"out":{"title":"Output","type":"any"}}},"fn":"state.el = null;\nstate.clickHandler = function(ev) {\n  output({\n    event: ev,\n    out: state.in\n  });\n};\n\non.input.element = function() {\n  if (state.el) {\n    state.el.removeEventListener('click', state.clickHandler);\n    state.el.innerHTML = null;\n  }\n  state.el = document.createElement('button');\n  state.el.setAttribute('type', 'button');\n  state.el.innerHTML = input.label;\n  state.el.className = input.classList;\n  Object.keys(input.attr).forEach(function(name) {\n    state.el.setAttribute(name, input.attr[name]);\n  });\n  state.el.addEventListener('click', state.clickHandler);\n  input.element.appendChild(state.el);\n  output({\n    element: input.element\n  });\n};\n\non.input.in = function () {\n  state.in = data;\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"json-editor":{"editor":{"_id":"54b36348b314b122580582fa","name":"editor","ns":"json-editor","title":"JSON Editor","description":"JSON Editor","async":true,"phrases":{"active":"Creating JSON Editor"},"dependencies":{"npm":{"json-editor":"latest"}},"ports":{"input":{"element":{"title":"Element","description":"Element","type":"HTMLElement"},"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"schema":{"title":"Schema","type":"object","description":"A valid JSON Schema to use for the editor. Version 3 and Version 4 of the draft specification are supported.","async":true},"enable":{"title":"Enable","description":"Enable","async":true},"disable":{"title":"Disable","description":"Disable","async":true},"options":{"title":"Options","type":"object","properties":{"ajax":{"title":"Ajax","description":"If true, JSON Editor will load external URLs in $ref via ajax.","default":false},"disable_array_add":{"title":"Disable array add","description":"If true, remove all `add row` buttons from arrays.","default":false},"disable_array_delete":{"title":"Disable array delete","description":"If true, remove all `delete row` buttons from arrays.","default":false},"disable_array_reorder":{"title":"Disable array reorder","description":"If true, remove all `move up` and `move down` buttons from arrays.","default":false},"disable_collapse":{"title":"Disable collapse","description":"If true, remove all collapse buttons from objects and arrays.","default":false},"disable_edit_json":{"title":"Disable edit json","description":"If true, remove all Edit JSON buttons from objects.","default":false},"disable_properties":{"title":"Disable properties","description":"If true, remove all Edit Properties buttons from objects.","default":false},"form_name_root":{"title":"Form name root","description":"The first part of the `name` attribute of form inputs in the editor. An full example name is `root[person][name]` where `root` is the form_name_root.","default":"root"},"iconlib":{"title":"Iconlib","description":"The icon library to use for the editor. See the CSS Integration section below for more info.","default":null},"no_additional_properties":{"title":"No additional properties","description":"If true, objects can only contain properties defined with the properties keyword.","default":false},"refs":{"title":"Refs","description":"An object containing schema definitions for URLs. Allows you to pre-define external schemas.","default":{}},"required_by_default":{"title":"Required by default","description":"If true, all schemas that don't explicitly set the required property will be required.","default":false},"show_errors":{"title":"Show errors","description":"When to show validation errors in the UI. Valid values are interaction, change, always, and never.","default":"interaction"},"startval":{"title":"Start value","description":" Seed the editor with an initial value. This should be valid against the editor's schema.","default":null},"template":{"title":"Template","description":"The JS template engine to use. See the Templates and Variables section below for more info.","default":"default"},"theme":{"title":"Theme","description":"The CSS theme to use. See the CSS Integration section below for more info.","default":"html"}}}},"output":{"out":{"title":"out","type":"string"},"editor":{"title":"Editor","type":"JSONEditor"}}},"fn":"state.jsonEditor = null;\nstate.changeHandler = function() {\n    output({out: state.jsonEditor.getValue()});\n};\n\non.input.in = function() {\n  state.in = data;\n  if (state.jsonEditor) {\n    state.jsonEditor.setValue(state.in);\n  }\n};\n\non.input.schema = function() {\n  state.schema = input.options.schema = input.schema;\n  if (state.jsonEditor) {\n    state.jsonEditor.off('change', state.changeHandler);\n    state.jsonEditor.destroy();\n  }\n  state.jsonEditor = new json_editor(input.element, input.options);\n  // problem if state.in is not about this schema..\n  state.jsonEditor.on('ready', function() {\n    if (state.in) {\n      state.jsonEditor.setValue(state.in);\n    }\n    state.jsonEditor.on('change', state.changeHandler);\n    output({editor: state.jsonEditor});\n  });\n};\n\non.input.enable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.enable();\n  }\n};\n\non.input.disable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.disable();\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"validate":{"_id":"54bc6c5cfa15e75e679fd1ad","name":"validate","ns":"json-editor","title":"JSON Editor Validate","description":"JSON Editor Validate","async":true,"phrases":{"active":"Validating form"},"ports":{"input":{"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"editor":{"title":"Editor","type":"function","description":"JSONEditor instance"}},"output":{"out":{"title":"Output","type":"string"},"errors":{"title":"Errors","type":"array","items":{"type":"object","properties":{"path":{"title":"Path","description":"a dot separated path into the JSON object (e.g. `root.path.to.field`)","type":"string"},"property":{"title":"Property","description":"schema keyword that triggered the validation error (e.g. `minLength`)","type":"string"},"message":{"title":"Message","type":"string"}}}}}},"fn":"on.input.in = function() {\n  var errors = input.editor.validate(data);\n  if(errors.length) {\n    output({errors: errors});\n  } else {\n    output({out: data});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"object":{"keys":{"_id":"52ef3630cf8e1bab142d5394","name":"keys","ns":"object","async":true,"description":"Retrieve all the names of the object's properties","phrases":{"active":"Retrieving object properties"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true},"path":{"title":"Path","type":"string","default":null}},"output":{"out":{"title":"out","type":"array"}}},"dependencies":{"npm":{"underscore":"1.x.x","dot-object":"0.x.x"}},"fn":"on.input.in = function() {\n  var val = input.path ? dot_object().pick(input.path, data) : data;\n  output( { out: underscore.keys(val) } );\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"create":{"_id":"52fa908e909495ebbe6ded4c","name":"create","ns":"object","async":true,"description":"Create an object, if input is a direct object it just returns a copy of the object","phrases":{"active":"Creating object"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true}},"output":{"out":{"title":"out","type":"object"}}},"fn":"on.input.in = function(data) { output({out: data}); };\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"data":{"pick":{"_id":"527d857e83f0adcc47800e7c","name":"pick","ns":"data","title":"Pick","async":true,"description":"Pick one value from an object","phrases":{"active":"Picking {{input.path}} from object"},"ports":{"input":{"in":{"title":"Object","description":"An Object, e.g { name: { first: 'John', last: 'Doe' } }","type":"object","async":true},"path":{"title":"Path","description":"Specify a path with . syntax (e.g. name.last )","type":"string","required":true}},"output":{"out":{"title":"Output","type":"any"},"error":{"title":"Error","type":"Error"}}},"dependencies":{"npm":{"dot-object":"0.x.x"}},"fn":"on.input.in = function(data) {\n  // dot_object api should be fixed..\n  var res = dot_object().pick(input.path, data);\n  if(typeof res !== 'undefined') {\n    output({out: res});\n  } else {\n    output({error: Error(input.path + ' not found')});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"string":{"append":{"_id":"52ef363bcf8e1bab142d53b7","name":"append","ns":"string","description":"Appends a string to an other string","phrases":{"active":"Appending string"},"ports":{"input":{"in":{"title":"String","type":"string","required":true},"append":{"title":"Other String","type":"string","required":true}},"output":{"out":{"title":"String","type":"string"}}},"fn":"output.out = input.in + input.append\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"array":{"map":{"_id":"54b8835afa15e75e679fd19d","name":"map","ns":"array","async":true,"description":"Creates new array output with the results of calling the provided function on every element in this array","phrases":{"active":"Mapping array"},"ports":{"input":{"in":{"title":"Value","type":"array","async":true},"fn":{"title":"Function","type":"function","args":["val","index","array"]}},"output":{"out":{"title":"Output","type":"array"}}},"fn":"on.input.in = function() {\n  output({\n    out: data.map(input.fn)\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"template":{"mustache":{"_id":"52645993df5da0102500005e","name":"mustache","ns":"template","description":"Mustache Template engine","phrases":{"active":"Compiling mustache template"},"ports":{"input":{"body":{"type":"string","format":"html","title":"Template body","description":"The body of the mustache template","required":true},"vars":{"type":"object","title":"Input variables","description":"the input variables for this template","required":true,"readonly":true}},"output":{"out":{"title":"String","type":"string"}}},"dependencies":{"npm":{"mustache":"latest"}},"fn":"output = {\n  out: mustache.render(input.body, input.vars)\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"utils":{"dummy":{"_id":"52ef363dcf8e1bab142d53bb","name":"dummy","ns":"utils","title":"Dummy","description":"Takes an input and passes it to output.","phrases":{"active":"Dummy"},"ports":{"input":{"in":{"type":"any","title":"Input"}},"output":{"out":{"type":"any","title":"Output"}}},"fn":"output.out = input. in\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}},"./{ns}/{name}.fbp":{},"./{name}.fbp":{},"{.ns}/{name}.fbp":{},"{name}.fbp":{},"{ns}/{name}.fbp":{}};
 
 };
 
@@ -24186,13 +23980,11 @@ Loader.prototype.getNodeDefinition = function(node, map) {
 var Flow = require('chix-flow').Flow;
 var loader = new Loader();
 
-var map = {"type":"flow","nodes":[{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"ProtocolEl","title":"ProtocolEl","ns":"dom","name":"querySelector","context":{"selector":"#protocol"}},{"id":"CommandEl","title":"CommandEl","ns":"dom","name":"querySelector","context":{"selector":"#command"}},{"id":"EditorEl","title":"EditorEl","ns":"dom","name":"querySelector","context":{"selector":"#editor"}},{"id":"ButtonEl","title":"ButtonEl","ns":"dom","name":"querySelector","context":{"selector":"#button"}},{"id":"ClearEl","title":"ClearEl","ns":"dom","name":"querySelector","context":{"selector":"#clear"}},{"id":"SelectProtocol","title":"SelectProtocol","ns":"bootstrap","name":"select","context":{"label":"Protocol","options":[{"label":"Select..","value":"clear"},{"label":"Graph","value":"graph"},{"label":"Network","value":"network"},{"label":"Runtime","value":"runtime"},{"label":"Component","value":"component"}]}},{"id":"SelectCommand","title":"SelectCommand","ns":"bootstrap","name":"select","context":{"label":"Command"}},{"id":"ClearCommands","title":"ClearCommands","ns":"dom","name":"setHtml","context":{"html":""}},{"id":"ClearEditor","title":"ClearEditor","ns":"dom","name":"setHtml","context":{"html":""}},{"id":"CommandEditor","title":"CommandEditor","ns":"json-editor","name":"editor","context":{"options":{"theme":"bootstrap3","disable_edit_json":true,"disable_collapse":true,"disable_properties":true,"required_by_default":true,"show_errors":"always"}}},{"id":"Validate","title":"Validate","ns":"json-editor","name":"validate"},{"id":"Button","title":"Button","ns":"bootstrap","name":"button","context":{"label":"Save"}},{"id":"ClearButton","title":"ClearButton","ns":"bootstrap","name":"button","context":{"in":{},"label":"Clear"}},{"id":"GraphCommands","title":"GraphCommands","ns":"models","name":"model","provider":"x"},{"id":"Message","title":"Message","ns":"protocol","name":"message","provider":"d"}],"links":[{"source":{"id":"ProtocolEl","port":"selection"},"target":{"id":"SelectProtocol","port":"element"},"metadata":{"title":"ProtocolEl selection -> element SelectProtocol"}},{"source":{"id":"CommandEl","port":"selection"},"target":{"id":"SelectCommand","port":"element","setting":{"persist":true}},"metadata":{"title":"CommandEl selection -> element SelectCommand"}},{"source":{"id":"EditorEl","port":"selection"},"target":{"id":"CommandEditor","port":"element","setting":{"persist":true}},"metadata":{"title":"EditorEl selection -> element CommandEditor"}},{"source":{"id":"ButtonEl","port":"selection"},"target":{"id":"Button","port":"element"},"metadata":{"title":"ButtonEl selection -> element Button"}},{"source":{"id":"ClearEl","port":"selection"},"target":{"id":"ClearButton","port":"element"},"metadata":{"title":"ClearEl selection -> element ClearButton"}},{"source":{"id":"CommandEl","port":"selection"},"target":{"id":"ClearCommands","port":"element","setting":{"persist":true}},"metadata":{"title":"CommandEl selection -> element ClearCommands"}},{"source":{"id":"EditorEl","port":"selection"},"target":{"id":"ClearEditor","port":"element","setting":{"persist":true}},"metadata":{"title":"EditorEl selection -> element ClearEditor"}},{"source":{"id":"SelectProtocol","port":"out"},"target":{"id":"GraphCommands","port":"in"},"metadata":{"title":"SelectProtocol out -> in GraphCommands"}},{"source":{"id":"SelectProtocol","port":"out","setting":{"index":"clear"}},"target":{"id":"ClearCommands","port":":start"},"metadata":{"title":"SelectProtocol out -> :start ClearCommands"}},{"source":{"id":"SelectProtocol","port":"out"},"target":{"id":"ClearEditor","port":":start"},"metadata":{"title":"SelectProtocol out -> :start ClearEditor"}},{"source":{"id":"GraphCommands","port":"options"},"target":{"id":"SelectCommand","port":"options"},"metadata":{"title":"GraphCommands options -> options SelectCommand"}},{"source":{"id":"CommandEditor","port":"out"},"target":{"id":"Button","port":"in"},"metadata":{"title":"CommandEditor out -> in Button"}},{"source":{"id":"CommandEditor","port":"editor"},"target":{"id":"Validate","port":"editor"},"metadata":{"title":"CommandEditor editor -> editor Validate"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Button out -> msg Log"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Validate","port":"in"},"metadata":{"title":"Button out -> in Validate"}},{"source":{"id":"Validate","port":"errors"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Validate errors -> msg Log"}},{"source":{"id":"Validate","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Validate out -> msg Log"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Message","port":"in"},"metadata":{"title":"Button out -> in Message"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Message","port":"vars"},"metadata":{"title":"Button out -> vars Message"}},{"source":{"id":"Message","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Message out -> msg Log"}},{"source":{"id":"Message","port":"out"},"target":{"id":"CommandEditor","port":"in"},"metadata":{"title":"Message out -> in CommandEditor"}},{"source":{"id":"Message","port":"event","setting":{"index":"srcElement"}},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Message event -> msg Log"}},{"source":{"id":"Message","port":"event"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Message event -> msg Log"}},{"source":{"id":"ClearButton","port":"out"},"target":{"id":"CommandEditor","port":"in"},"metadata":{"title":"ClearButton out -> in CommandEditor"}},{"source":{"id":"SelectCommand","port":"out"},"target":{"id":"GraphCommands","port":"command"},"metadata":{"title":"SelectCommand out -> command GraphCommands"}},{"source":{"id":"GraphCommands","port":"schema"},"target":{"id":"CommandEditor","port":"schema"},"metadata":{"title":"GraphCommands schema -> schema CommandEditor"}},{"source":{"id":"GraphCommands","port":"schema"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"GraphCommands schema -> msg Log"}}],"title":"Protocol Selectbox","ns":"json-editor","name":"protocol","id":"MyProtocol","providers":{"x":{"path":"./graph/{ns}/{name}.fbp","name":"x"},"d":{"path":"./graph/{name}.fbp","name":"d"},"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
+var map = {"type":"flow","nodes":[{"id":"Log","title":"Log","ns":"console","name":"log"},{"id":"ProtocolEl","title":"ProtocolEl","ns":"dom","name":"querySelector","context":{"selector":"#protocol"}},{"id":"CommandEl","title":"CommandEl","ns":"dom","name":"querySelector","context":{"selector":"#command"}},{"id":"EditorEl","title":"EditorEl","ns":"dom","name":"querySelector","context":{"selector":"#editor"}},{"id":"ButtonEl","title":"ButtonEl","ns":"dom","name":"querySelector","context":{"selector":"#button"}},{"id":"ClearEl","title":"ClearEl","ns":"dom","name":"querySelector","context":{"selector":"#clear"}},{"id":"SelectProtocol","title":"SelectProtocol","ns":"bootstrap","name":"select","context":{"label":"Protocol","options":[{"label":"Select..","value":"clear"},{"label":"Graph","value":"graph"},{"label":"Network","value":"network"},{"label":"Runtime","value":"runtime"},{"label":"Component","value":"component"}]}},{"id":"SelectCommand","title":"SelectCommand","ns":"bootstrap","name":"select","context":{"label":"Command"}},{"id":"ClearCommands","title":"ClearCommands","ns":"dom","name":"setHtml","context":{"html":""}},{"id":"ClearEditor","title":"ClearEditor","ns":"dom","name":"setHtml","context":{"html":""}},{"id":"CommandEditor","title":"CommandEditor","ns":"json-editor","name":"editor","context":{"options":{"theme":"bootstrap3","disable_edit_json":true,"disable_collapse":true,"disable_properties":true,"required_by_default":true,"show_errors":"always"}}},{"id":"Validate","title":"Validate","ns":"json-editor","name":"validate"},{"id":"Button","title":"Button","ns":"bootstrap","name":"button","context":{"label":"Save"}},{"id":"ClearButton","title":"ClearButton","ns":"bootstrap","name":"button","context":{"in":{},"label":"Clear"}},{"id":"GraphCommands","title":"GraphCommands","ns":"models","name":"model","provider":"x"},{"id":"Message","title":"Message","ns":"protocol","name":"message","provider":"d"}],"links":[{"source":{"id":"ProtocolEl","port":"selection"},"target":{"id":"SelectProtocol","port":"element"},"metadata":{"title":"ProtocolEl selection -> element SelectProtocol"}},{"source":{"id":"CommandEl","port":"selection"},"target":{"id":"SelectCommand","port":"element","setting":{"persist":true}},"metadata":{"title":"CommandEl selection -> element SelectCommand"}},{"source":{"id":"EditorEl","port":"selection"},"target":{"id":"CommandEditor","port":"element","setting":{"persist":true}},"metadata":{"title":"EditorEl selection -> element CommandEditor"}},{"source":{"id":"ButtonEl","port":"selection"},"target":{"id":"Button","port":"element"},"metadata":{"title":"ButtonEl selection -> element Button"}},{"source":{"id":"ClearEl","port":"selection"},"target":{"id":"ClearButton","port":"element"},"metadata":{"title":"ClearEl selection -> element ClearButton"}},{"source":{"id":"CommandEl","port":"selection"},"target":{"id":"ClearCommands","port":"element","setting":{"persist":true}},"metadata":{"title":"CommandEl selection -> element ClearCommands"}},{"source":{"id":"EditorEl","port":"selection"},"target":{"id":"ClearEditor","port":"element","setting":{"persist":true}},"metadata":{"title":"EditorEl selection -> element ClearEditor"}},{"source":{"id":"SelectProtocol","port":"out"},"target":{"id":"GraphCommands","port":"in"},"metadata":{"title":"SelectProtocol out -> in GraphCommands"}},{"source":{"id":"SelectProtocol","port":"out","setting":{"index":"clear"}},"target":{"id":"ClearCommands","port":":start"},"metadata":{"title":"SelectProtocol out -> :start ClearCommands"}},{"source":{"id":"SelectProtocol","port":"out"},"target":{"id":"ClearEditor","port":":start"},"metadata":{"title":"SelectProtocol out -> :start ClearEditor"}},{"source":{"id":"GraphCommands","port":"options"},"target":{"id":"SelectCommand","port":"options"},"metadata":{"title":"GraphCommands options -> options SelectCommand"}},{"source":{"id":"CommandEditor","port":"out"},"target":{"id":"Button","port":"in"},"metadata":{"title":"CommandEditor out -> in Button"}},{"source":{"id":"CommandEditor","port":"editor"},"target":{"id":"Validate","port":"editor"},"metadata":{"title":"CommandEditor editor -> editor Validate"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Button out -> msg Log"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Validate","port":"in"},"metadata":{"title":"Button out -> in Validate"}},{"source":{"id":"Validate","port":"errors"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Validate errors -> msg Log"}},{"source":{"id":"Validate","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Validate out -> msg Log"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Message","port":"in"},"metadata":{"title":"Button out -> in Message"}},{"source":{"id":"Button","port":"out"},"target":{"id":"Message","port":"vars"},"metadata":{"title":"Button out -> vars Message"}},{"source":{"id":"Message","port":"out"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Message out -> msg Log"}},{"source":{"id":"Message","port":"out"},"target":{"id":"CommandEditor","port":"in"},"metadata":{"title":"Message out -> in CommandEditor"}},{"source":{"id":"Message","port":"event","setting":{"index":"srcElement"}},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Message event -> msg Log"}},{"source":{"id":"Message","port":"event"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"Message event -> msg Log"}},{"source":{"id":"ClearButton","port":"out"},"target":{"id":"CommandEditor","port":"in"},"metadata":{"title":"ClearButton out -> in CommandEditor"}},{"source":{"id":"SelectCommand","port":"out"},"target":{"id":"GraphCommands","port":"command"},"metadata":{"title":"SelectCommand out -> command GraphCommands"}},{"source":{"id":"GraphCommands","port":"schema"},"target":{"id":"CommandEditor","port":"schema"},"metadata":{"title":"GraphCommands schema -> schema CommandEditor"}},{"source":{"id":"GraphCommands","port":"schema"},"target":{"id":"Log","port":"msg"},"metadata":{"title":"GraphCommands schema -> msg Log"}}],"title":"Protocol Selectbox","ns":"json-editor","name":"protocol","id":"MyProtocol","providers":{"x":{"path":"./graphs/{ns}/{name}.fbp","name":"x"},"d":{"path":"./graphs/{name}.fbp","name":"d"},"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}};
 
 var actor;
 window.Actor = actor = Flow.create(map, loader);
 
-var monitor = require('chix-monitor-npmlog').Actor;
-monitor(console, actor);
 
 function onDeviceReady() {
 actor.run();
@@ -24211,4 +24003,4 @@ if (navigator.userAgent.match(/(iPhone|iPod|iPad|Android|BlackBerry|IEMobile)/))
 // as long as this module is loaded.
 module.exports = actor;
 
-},{"chix-flow":"jXAsbI","chix-monitor-npmlog":"HNG52E"}]},{},["gXiLoN"])
+},{"chix-flow":"jXAsbI"}]},{},["gXiLoN"])
