@@ -1741,7 +1741,7 @@ Actor.prototype.push = function() {
         this.sendIIP(iip, '');
       }
       else {
-        console.log(node.identifier, ' not startable');
+        debug('%s: not startable', this.identifier);
       }
     }
   }
@@ -2097,6 +2097,9 @@ Actor.prototype.__input = function(link, p) {
 
   var targetNode = this.getNode(link.target.id);
 
+  // give owner ship to targetNode
+  p.setOwner(targetNode);
+
   var ret = targetNode.fill(link.target, p);
 
   // breakpoint
@@ -2106,6 +2109,9 @@ Actor.prototype.__input = function(link, p) {
     // set node in error state and output error to ioManager
     targetNode.error(ret);
 
+    p.release(targetNode);
+    p.setOwner(link);
+
     debug('%s: reject %s', this.identifier, ret);
     self.ioHandler.reject(ret, link, p);
 
@@ -2114,14 +2120,12 @@ Actor.prototype.__input = function(link, p) {
 
     // something should unlock.
     // having this reject unlock it is too much free form.
-
     debug('%s: soft reject re-queue', this.identifier);
     // `soft reject`
     self.ioHandler.reject(ret, link, p);
 
   }
   else {
-    // would like to unlock all
 
     // unlock *all* queues targeting this node.
     // the IOHandler can do this.
@@ -2553,7 +2557,12 @@ Actor.prototype.sendIIPs = function(iips) {
 
     self.ioHandler.emit('send', link);
 
-    var p = new Packet(JSON.parse(JSON.stringify(link.data)));
+    // Packet owned by the link
+    var p = new Packet(
+      link,
+      JSON.parse(JSON.stringify(link.data)),
+      this.getNode(link.target.id).getPortType(link.target.port)
+    );
 
     // a bit too direct, ioHandler should do this..
     self.ioHandler.queueManager.queue(link.ioid, p);
@@ -2616,7 +2625,12 @@ Actor.prototype.sendIIP = function(target, data) {
 
   this.ioHandler.emit('send', xLink);
 
-  var p = new Packet(JSON.parse(JSON.stringify(xLink.data)));
+  var p = new Packet(
+    xLink,
+    JSON.parse(JSON.stringify(xLink.data)),
+    // target port type
+    this.getNode(xLink.target.id).getPortType(xLink.target.port)
+  );
 
   this.ioHandler.queueManager.queue(xLink.ioid, p);
 
@@ -3091,7 +3105,7 @@ Actor.prototype.hasParent = function() {
 
 module.exports = Actor;
 
-},{"../lib/context/defaultProvider":10,"../lib/io/mapHandler":13,"../lib/multisort":15,"../lib/process/defaultManager":22,"./connector":9,"./flow":11,"./link":14,"./node":16,"./node/polymer":18,"./packet":19,"./run":24,"./validate":28,"chix-loader":36,"debug":37,"events":1,"util":6,"uuid":49}],9:[function(require,module,exports){
+},{"../lib/context/defaultProvider":10,"../lib/io/mapHandler":13,"../lib/multisort":15,"../lib/process/defaultManager":22,"./connector":9,"./flow":11,"./link":14,"./node":16,"./node/polymer":18,"./packet":19,"./run":24,"./validate":28,"chix-loader":38,"debug":39,"events":1,"util":6,"uuid":52}],9:[function(require,module,exports){
 'use strict';
 
 var util    = require('util');
@@ -3512,6 +3526,14 @@ Flow.prototype.setContextProperty = function(port, data) {
 
 };
 
+Flow.prototype.getPortType = function(port) {
+  if (port === ':start') {
+    return 'any';
+  }
+  var portDef = this.getPortDefinition(port, 'input');
+  this.getNode(portDef.nodeId).getPortType(portDef.name);
+};
+
 Flow.prototype.clearContextProperty = function(port) {
 
   var portDef = this.getPortDefinition(port, 'input');
@@ -3596,13 +3618,19 @@ Flow.prototype.error = function(node, err) {
 
 Flow.prototype.fill = function(target, p) {
 
+  var node;
+
   debug('%s:%s fill', this.identifier, target.port);
 
   if (target.action && !this.isAction()) {
 
     // NOTE: action does not take fork into account?
     // test this later. it should be in the context of the currentActor.
-    return this.action(target.action).fill(target, p);
+
+    node = this.action(target.action);
+    p.release(this);
+    p.setOwner(node);
+    node.fill(target, p);
 
   }
   else {
@@ -3626,12 +3654,13 @@ Flow.prototype.fill = function(target, p) {
       // delegate this to the node this port belongs to.
       var portDef = this.getPortDefinition(target.port, 'input');
 
-      var node = this.getNode(portDef.nodeId);
+      node = this.getNode(portDef.nodeId);
 
       if (!this.linkMap.hasOwnProperty(target.wire.id)) {
         throw Error('link not found within linkMap');
       }
-
+      p.release(this);
+      p.setOwner(node);
       var err = node.fill(this.linkMap[target.wire.id].target, p);
 
       if (util.isError(err)) {
@@ -3741,7 +3770,7 @@ Flow.prototype.getPortDefinition = function(port, type) {
         port,
         this.ns,
         this.name,
-        Object.keys(this.ports.input).toString()
+        Object.keys(this.ports[type]).toString()
       )
     );
   }
@@ -3855,6 +3884,7 @@ Flow.prototype.plug = function(target) {
 
     if (target.port === ':start') {
       this.addPort('input', ':start', {
+        name: ':start',
         type: 'any'
       });
     }
@@ -4173,8 +4203,13 @@ Flow.prototype.listenForOutput = function() {
     return function internalPortHandlerFlow(data) {
       if (internalPort === data.port) {
 
+        var p = data.out;
+
+        // take ownership
+        p.setOwner(self);
+
         debug('%s:%s output', self.identifier, port);
-        self.sendPortOutput(port, data.out);
+        self.sendPortOutput(port, p);
 
         // there is no real way to say a graph has executed.
         // So just consider each output as an execution.
@@ -4354,7 +4389,11 @@ Flow.prototype.isStartable = function() {
 };
 
 Flow.prototype.event = function(port, output) {
-  var p = new Packet(output);
+  var p = new Packet(
+    this,
+    output,
+    'object' // always object
+  );
   this.sendPortOutput(port, p);
 };
 
@@ -4373,6 +4412,9 @@ Flow.prototype.sendPortOutput = function(port, p) {
   if (this.isAction()) {
     out.action = self.action;
   }
+
+  // give up ownership
+  p.release(this);
 
   this.emit('output', out);
 
@@ -4526,6 +4568,7 @@ Flow.prototype.expose = function(input, output) {
         /////// setup callbacks
         this.on('output', function output(data) {
           if (data.node.id === self.id && cb.hasOwnProperty(data.port)) {
+            // TODO: does not take ownership into account
             cb[data.port](data.out);
           }
         });
@@ -4587,7 +4630,7 @@ Flow.prototype.hasParent = function() {
 
 module.exports = Flow;
 
-},{"./ConnectionMap":7,"./actor":8,"./link":14,"./packet":19,"./validate":28,"debug":37,"util":6}],12:[function(require,module,exports){
+},{"./ConnectionMap":7,"./actor":8,"./link":14,"./packet":19,"./validate":28,"debug":39,"util":6}],12:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -4596,20 +4639,23 @@ var util = require('util');
  *
  * Handles the index
  *
+ * TODO: packet is still needed, because index is set
+ *
  * @param {Link} link
+ * @param {Data} data
  * @param {Packet} p
  * @api public
  */
-module.exports = function handleIndex(link, p) {
+module.exports = function handleIndex(link, data, p) {
   // TODO: data should be better defined and a typed object
   var index = link.source.get('index');
   if (/^\d+/.test(index)) {
     // numeric
-    if (Array.isArray(p.data)) {
-      if (index < p.data.length) {
+    if (Array.isArray(data)) {
+      if (index < data.length) {
         // new remember index.
         p.index = index;
-        return p.data[index];
+        return data[index];
       }
       else {
         throw new Error(
@@ -4631,15 +4677,15 @@ module.exports = function handleIndex(link, p) {
     }
   }
   else {
-    if (typeof p.data === 'object') {
-      if (p.data.hasOwnProperty(index)) {
+    if (typeof data === 'object') {
+      if (data.hasOwnProperty(index)) {
         // new remember index.
         p.index = index;
-        return p.data[index];
+        return data[index];
       }
       else {
         // maybe do not fail hard and just send to the error port.
-        console.log(p.data);
+        console.log(p);
         throw new Error(
           util.format(
             'Property `%s` not found on object output port `%s`',
@@ -4671,19 +4717,6 @@ var handleIndex = require('./indexHandler');
 var isPlainObject = require('is-plain-object');
 var DefaultQueueManager = require('../queue/defaultManager');
 var debug = require('debug')('chix:io');
-
-function cloneData(p, type) {
-  /* function type does not mean the data itself is directly
-   * a function, it can also be a plain object holding
-   * functions. so what is specified is leading.
-   */
-  if (type === 'function') {
-    return;
-  }
-  if (typeof p.data === 'object' && isPlainObject(p.data)) {
-    p.data = JSON.parse(JSON.stringify(p.data));
-  }
-}
 
 /**
  *
@@ -5004,6 +5037,11 @@ IoMapHandler.prototype.receiveFromQueue = function(ioid, p) {
  *
  */
 IoMapHandler.prototype.send = function(link, p) {
+
+  if (!(p instanceof Packet)) {
+    throw Error('send expects a packet');
+  }
+
   if (link.source.has('pointer')) { // is just a boolean
     debug('%s: handling pointer', link.ioid);
     var identifier;
@@ -5078,30 +5116,30 @@ IoMapHandler.prototype.__sendData = function(link, p) {
   if (this._shutdown) {
     // TODO:: probably does not both have to be dropped
     // during __sendData *and* during output
+    p.release(link);
     this.drop(p, link);
   }
   else {
     var data;
     if (link.target.has('cyclic') &&
-      Array.isArray(p.data) // second time it's not an array anymore
+      Array.isArray(p.read(link)) // second time it's not an array anymore
     ) {
       debug('%s: cycling', link.ioid);
       // grouping
       // The counter part will be 'collect'
       var g = this.CHI.group();
-      if (p.data.length === 0) {
+      if (p.read(link).length === 0) {
         return false;
       }
-      // make a copy otherwise if output goes to several ports
-      // it will receive a popped version.
-      //
-      // Ok, this has to be removed and source ports should set as cyclic.
-      // Not target ports.
-      data = JSON.parse(JSON.stringify(p.data));
+      data = JSON.parse(JSON.stringify(p.read(link)));
       var i;
       for (i = 0; i < data.length; i++) {
         // create new packet
-        var newp = new Packet(data[i]);
+        var newp = new Packet(
+          link,
+          data[i],
+          typeof data[i] // not sure if this will always work.
+        );
         // this is a copy taking place..
         newp.set('chi', p.chi ? JSON.parse(JSON.stringify(p.chi)) : {});
         g.item(newp.chi);
@@ -5112,42 +5150,26 @@ IoMapHandler.prototype.__sendData = function(link, p) {
       return; // RETURN
     }
     var cp = p; // current packet
-    // too bad cannot check the receiver type.
-    // TODO: maybe have p.type() so the packet can tell it's content type.
-    // plain object is a bit harder though would have to introduce
-    // PLAIN_OBJECT type or something
-    // The packet itself should tell what it is,
-    // not checking p.data externally like this.
-    /*
-    if (typeof cp.data === 'object' && isPlainObject(cp.data)) {
-      cp.data = JSON.parse(JSON.stringify(cp.data));
-    }
-    */
-    cloneData(cp, 'function');
+
+    // clone should not be needed, this is done elsewhere.
+    // cp is also not needed
+    // this.cloneData(link, cp, 'function');
     // TODO: not sure if index should stay within the packet.
     if (link.source.has('index') && !cp.hasOwnProperty('index')) {
-      //if (link.source.has('index')) {
-      // above already cloned if possible.
-      // what is not cloned is CHI, so could cause a problem..
       cp.chi = JSON.parse(JSON.stringify(cp.chi));
-      cp = p.clone(false); // important!
-      if (undefined === cp.data[link.source.get('index')]) {
-        // this is allowed now for async array ports.
-        // the component will only send one index at a time.
-        // this is useful for routing.
-        // maybe only enable this with a certain setting on the port later on.
-        debug('%s: INDEX UNDEFINED %s', link.ioid, link.source, cp.data);
-        // does this stop the loop, because it should not.
+      cp = p.clone(link, false); // important!
+      if (undefined === cp.read(link)[link.source.get('index')]) {
+        debug('%s: INDEX UNDEFINED %s', link.ioid, link.source, cp.read(link));
         return; // nop
       }
       else {
-        cp.data = handleIndex(link, cp);
+        cp.write(link, handleIndex(link, cp.read(link), cp));
       }
     }
     // TODO: probably just remove this emit. (chix-runtime is using it)
     this.emit('data', {
       link: link,
-      data: cp.data // only emit the data
+      data: cp.read(link)// only emit the data
     });
 
     debug('%s: writing packet', link.ioid);
@@ -5232,41 +5254,69 @@ IoMapHandler.prototype.__monitor = function(eventType, pid, cb, how) {
 //  this.receive(dat.node, dat.port, dat.out, dat.action);
 IoMapHandler.prototype.receive = function(source, port, p, action) {
   var i;
-  // If the output of this node has any target nodes
-  if (this.targetMap.hasOwnProperty(source.pid)) {
-    // If there are any target nodes defined
-    if (this.targetMap[source.pid].length) {
-      // Iterate those targets
-      for (i = 0; i < this.targetMap[source.pid].length; i++) {
-        // Process this link
-        var xlink = this.targetMap[source.pid][i];
-        // If the link is about this source port
-        if (port === xlink.source.port) {
-          // did this output came from an action
-          // if so, is it an action we are listening for.
-          if (!action || xlink.source.action === action) {
-            if (xlink.source.get('collect')) {
-              debug('%s: collecting packets', xlink.ioid);
-              this.CHI.collect(xlink, p);
-              continue; // will be handled by event
-            }
-            //var noQueue = xlink.target.has('noqueue');
-            var noQueue = false;
-            this.emit('send', xlink);
-            // queue must always be used otherwise persist
-            // will not work..
-            if (noQueue) {
-              // must be sure, really no queue, also not after input.
-              this.send(xlink, p);
-            }
-            else {
-              debug('%s: queueing', xlink.ioid);
-              this.queueManager.queue(xlink.ioid, p);
+  var match = 0;
+
+  if (p.hasOwner()) {
+    // node should have released packet.
+    throw Error('Refusing to received owned packet');
+  } else {
+    // If the output of this node has any target nodes
+    if (this.targetMap.hasOwnProperty(source.pid)) {
+      // If there are any target nodes defined
+      if (this.targetMap[source.pid].length) {
+        // Iterate those targets
+        var length = this.targetMap[source.pid].length;
+        for (i = 0; i < length; i++) {
+          // Process this link
+          var xlink = this.targetMap[source.pid][i];
+          // If the link is about this source port
+          if (port === xlink.source.port) {
+            match++;
+            // did this output came from an action
+            // if so, is it an action we are listening for.
+            if (!action || xlink.source.action === action) {
+              if (xlink.source.get('collect')) {
+                debug('%s: collecting packets', xlink.ioid);
+                this.CHI.collect(xlink, p);
+                continue; // will be handled by event
+              }
+              //var noQueue = xlink.target.has('noqueue');
+              var noQueue = false;
+              this.emit('send', xlink);
+
+              p.setOwner(xlink);
+
+              // queue must always be used otherwise persist
+              // will not work..
+              if (noQueue) {
+                // must be sure, really no queue, also not after input.
+                this.send(xlink, p);
+              }
+              else {
+                debug('%s: queueing', xlink.ioid);
+                this.queueManager.queue(xlink.ioid, p);
+              }
+
+              if (i + 1 < length) {
+                p = p.clone(xlink);
+                p.release(xlink);
+              }
             }
           }
         }
       }
     }
+
+    if (port === 'error' && match === 0) {
+      throw Error(
+        util.format(
+          'Unhandled port error for %s: %s',
+          source.id,
+          p.dump()
+        )
+      );
+    }
+
   }
 };
 
@@ -5357,9 +5407,24 @@ IoMapHandler.prototype.drop = function(packet, origin) {
   this.emit('drop', packet);
 };
 
+/*
+IoMapHandler.prototype.cloneData = function(link, p, type) {
+  if (type === 'function') {
+    return;
+  }
+  if (typeof p.read(link) === 'object' && isPlainObject(p.read(link))) {
+    p.write(link,
+      JSON.parse(
+        JSON.stringify(p.read(link))
+      )
+    );
+  }
+};
+*/
+
 module.exports = IoMapHandler;
 
-},{"../packet":19,"../queue/defaultManager":23,"./indexHandler":12,"chix-chi":31,"debug":37,"events":1,"is-plain-object":42,"util":6,"uuid":49}],14:[function(require,module,exports){
+},{"../packet":19,"../queue/defaultManager":23,"./indexHandler":12,"chix-chi":31,"debug":39,"events":1,"is-plain-object":44,"util":6,"uuid":52}],14:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -5466,6 +5531,9 @@ Link.prototype.setTarget = function(targetId, port, settings, action) {
 Link.prototype.write = function(p) {
 
   this.writes++;
+
+  // loose ownership
+  p.release(this);
 
   // just re-emit
   this.emit('data', p);
@@ -5596,7 +5664,7 @@ Link.prototype.toJSON = function() {
 
 module.exports = Link;
 
-},{"./connector":9,"./setting":27,"./validate":28,"util":6,"uuid":49}],15:[function(require,module,exports){
+},{"./connector":9,"./setting":27,"./validate":28,"util":6,"uuid":52}],15:[function(require,module,exports){
 'use strict';
 
 /**
@@ -5747,6 +5815,10 @@ function xNode(id, node, identifier, CHI) {
   this.type = 'node';
 
   this.state = {};
+
+  this.persist = {};
+
+  this.transit = {};
 
   // remember def for .compile()
   this.def = node;
@@ -5940,12 +6012,19 @@ xNode.prototype.start = function() {
 };
 
 xNode.prototype.hasData = function(port) {
-  return undefined !== this.input[port];
+  //return undefined !== this.input[port].data;
+  //return undefined !== this.input[port];
+  return this.input.hasOwnProperty(port);
 };
 
 xNode.prototype.fill = function(target, data, settings) {
 
-  var p = data instanceof Packet ? data : new Packet(data);
+  var p;
+  if (data instanceof Packet) {
+    p = data;
+  } else {
+    p = new Packet(this, data, this.getPortType(target.port || target));
+  }
 
   // allow for simple api
   if (typeof target === 'string') {
@@ -5957,6 +6036,11 @@ xNode.prototype.fill = function(target, data, settings) {
       target.set('persist', true);
     }
     this.plug(target);
+  }
+
+  // better call it pointer
+  if (target.has('mask')) {
+    p.point(this, target.get('mask'));
   }
 
   var ret = this._receive(target, p);
@@ -5987,13 +6071,44 @@ xNode.prototype.fill = function(target, data, settings) {
  */
 xNode.prototype.$setContextProperty = function(port, data) {
   debug('%s:%s set context', this.identifier, port);
-  this.context[port] = data;
+  var p;
+  if (data instanceof Packet) {
+    p = data;
+  } else {
+    p = new Packet(this, data, this.getPortType(port));
+  }
+  this.context[port] = p;
+};
+
+xNode.prototype.getPortType = function(port) {
+  var i;
+  var obj;
+  var type;
+  if (Array.isArray(port)) {
+    obj = this.ports.input;
+    for (i = 0 ; i < port.length; i++) {
+      if (i === 0) {
+        obj = obj[port[i]];
+      } else {
+        obj = obj.properties[port[i]];
+      }
+    }
+    type = obj.type;
+  } else {
+    type = this.ports.input[port].type;
+  }
+  if (type) {
+    return type;
+  } else {
+    throw Error('Unable to determine type for ' + port);
+  }
 };
 
 xNode.prototype.clearContextProperty = function(port) {
 
   debug('%s:%s clear context', this.identifier, port);
 
+  // drop packet?
   delete this.context[port];
 
   this.event(':contextClear', {
@@ -6054,7 +6169,7 @@ xNode.prototype.__start = function() {
     }
   }
 
-  this.nodebox.input = this.input;
+  this.nodebox.set('input', this.unwrapPackets(this.input));
 
   // difference in notation, TODO: explain these constructions.
   // done before compile.
@@ -6461,13 +6576,18 @@ xNode.prototype._runPortBox = function(port) {
     node: this.export()
   });
 
-  sb.set('data', this.input[port]);
+  sb.set('data', this.input[port].read(this));
   sb.set('x', this.chi);
   sb.set('state', this.state);
   // sb.set('source', source); is not used I hope
-  sb.set('input', this.input); // add all (sync) input.
+
+  sb.set('input', this.unwrapPackets(this.input));
+  // add all (sync) input.
 
   this.setStatus('running');
+
+  // remember last one for cloneing
+  this.transit[port] = this.input[port];
 
   var ret = sb.run(this);
 
@@ -6497,9 +6617,8 @@ xNode.prototype._runPortBox = function(port) {
     return false;
   }
 
-  // todo portbox itself should probably also
-  // maintain it's runcount, this one is cumulative
   this.runCount++;
+  this.ports.input[port].runCount++;
 
   debug('%s:%s() executed', this.identifier, port);
 
@@ -6591,21 +6710,7 @@ xNode.prototype._fillPort = function(target, p) {
 
   var res;
 
-  // this is too early, defaults do not get filled this way.
-  if (this.ports.input[target.port].async === true &&
-    !this._allConnectedSyncFilled()) {
-
-    this.event(':portReject', {
-      node: this.export(),
-      port: target.port,
-      data: p
-    });
-
-    // do not accept
-    return false;
-  }
-
-  if (undefined === p.data) {
+  if (undefined === p.read(this)) {
     return Error('data may not be `undefined`');
   }
 
@@ -6613,20 +6718,36 @@ xNode.prototype._fillPort = function(target, p) {
   //this.handlePortSettings(target.port);
 
   // PACKET WRITE, TEST THIS
-  p.data = this._handleFunctionType(target.port, p.data);
+  // this is not good, it's too early.
+  p.write(this, this._handleFunctionType(target.port, p.read(this)));
 
-  res = this._validateInput(target.port, p.data);
+  res = this._validateInput(target.port, p.read(this));
 
   if (util.isError(res)) {
-
     return res;
-
   }
   else {
 
-    // todo: this logic must be externalized.
-    // node doesn't know about persist
-    if (!target.has('persist')) {
+    if (target.has('persist')) {
+      // do array index thing here also.
+      //this.persist[target.port] = p.data;
+      this.persist[target.port] = p;
+      return true;
+    } else {
+      // this is too early, defaults do not get filled this way.
+      if (this.ports.input[target.port].async === true &&
+        !this._allConnectedSyncFilled()) {
+
+        this.event(':portReject', {
+          node: this.export(),
+          port: target.port,
+          data: p
+        });
+
+        // do not accept
+        console.log('early block');
+        return false;
+      }
 
       try {
 
@@ -6694,7 +6815,7 @@ xNode.prototype._fillPort = function(target, p) {
 
     // set input port data
     // this could be changed to still contain the Packet.
-    this._fillInputPort(target.port, p.data);
+    this._fillInputPort(target.port, p);
 
     /**
      * Port Fill Event.
@@ -6733,14 +6854,14 @@ xNode.prototype._fillPort = function(target, p) {
 /**
  *
  * @param {string} port
- * @param {Mixed} value
+ * @param {Packet} p
  * @private
  */
-xNode.prototype._fillInputPort = function(port, value) {
+xNode.prototype._fillInputPort = function(port, p) {
 
   debug('%s:%s fill', this.identifier, port);
 
-  this.input[port] = value;
+  this.input[port] = p;
 
   // increment fill counter
   this.ports.input[port].fills++;
@@ -6844,11 +6965,9 @@ xNode.prototype._readyOrNot = function() {
     }
 
     // Check context/defaults etc. and fill it
-    var ret = portFiller.fill(
-      this.ports.input,
-      this.input,
-      this.context
-    );
+    // should only fill defaults for async ports..
+    // *if* the async port is not connected.
+    var ret = portFiller.fill(this);
 
     // TODO: if all are async, just skip all the above
     // async must be as free flow as possible.
@@ -6880,7 +6999,9 @@ xNode.prototype._readyOrNot = function() {
             // persistent async will have input etc.
             if ((this.ports.input[port].async ||
               this.ports.input[port].fn) &&
-              this.input[port] !== undefined) {
+              // need to check packet or?
+              this.input.hasOwnProperty(port)) {
+              //this.input[port] !== undefined) {
 
               ret = this._runPortBox(port);
 
@@ -6985,7 +7106,8 @@ xNode.prototype.freeInput = function() {
     port = this.inPorts[i];
 
     // TODO: don't call freeInput in the first place if undefined
-    if (this.input[port] !== undefined) {
+    //if (this.input[port] !== undefined) {
+    if (this.input.hasOwnProperty(port)) {
       this.freePort(port);
       freed.push(port);
     }
@@ -7002,7 +7124,7 @@ xNode.prototype.clearInput = function(port) {
 };
 
 xNode.prototype.freePort = function(port) {
-
+/*
   var persist = this.getPortOption('input', port, 'persist');
   if (persist) {
     // persist, chi, hmz, seeze to exist.
@@ -7011,39 +7133,51 @@ xNode.prototype.freePort = function(port) {
     debug('%s:%s persisting', this.identifier, port);
 
     // indexes are persisted per index.
+    // store inside persit
     if (Array.isArray(persist)) {
+      // TODO: means object is not supported..
+      this.persist[port] = [];
       for (var k in this.input[port]) {
         if (persist.indexOf(k) === -1) {
-          debug('%s:%s[%s] persisting', this.identifier, port, k);
+          //debug('%s:%s[%s] persisting', this.identifier, port, k);
           // remove
-          delete this.input[port][k];
+          //delete this.input[port][k];
+        } else {
+          debug('%s:%s[%s] persisting', this.identifier, port, k);
+          this.perists[port][k] = this.input[port][k];
         }
+        delete this.input[port][k];
       }
+    } else {
+
+      this.persist[port] = this.input[port];
+      delete this.input[port];
+
     }
-
   }
-  else {
+*/
+  //else {
 
-    // this also removes context and default..
-    this.clearInput(port);
+  // this also removes context and default..
+  this.clearInput(port);
 
-    debug('%s:%s :freePort event', this.identifier, port);
-    this.event(':freePort', {
-      node: this.export(),
-      link: this._activeConnections[port], // can be undefined, ok
-      port: port
-    });
+  debug('%s:%s :freePort event', this.identifier, port);
+  this.event(':freePort', {
+    node: this.export(),
+    link: this._activeConnections[port], // can be undefined, ok
+    port: port
+  });
 
-    this.emit('freePort', {
-      node: this.export(),
-      link: this._activeConnections[port],
-      port: port
-    });
+  this.emit('freePort', {
+    node: this.export(),
+    link: this._activeConnections[port],
+    port: port
+  });
 
-    // delete reference to active connection (if there was one)
-    // delete this._activeConnections[port];
-    this._activeConnections[port] = null;
-  }
+  // delete reference to active connection (if there was one)
+  // delete this._activeConnections[port];
+  this._activeConnections[port] = null;
+  //}
 
 };
 
@@ -7057,8 +7191,11 @@ xNode.prototype.freePort = function(port) {
  */
 xNode.prototype.allConnectedFilled = function() {
   for (var port in this.openPorts) {
-    if (this.input[port] === undefined) {
-      return Node.ALL_CONNECTED_NOT_FILLED;
+    if (this.openPorts.hasOwnProperty(port)) {
+      if (!this.input.hasOwnProperty(port)) {
+      //if (this.input[port] === undefined) {
+        return xNode.ALL_CONNECTED_NOT_FILLED;
+      }
     }
   }
   return true;
@@ -7080,16 +7217,22 @@ xNode.prototype._allConnectedSyncFilled = function() {
     if (!this.ports.input[port].async ||
       !this.ports.input[port].fn) {
 
-      if (this.ports.input[port].indexed) {
-        if (/object/i.test(this.ports.input[port].type)) {
-          return this._objectPortIsFilled(port);
+      // should be better index check perhaps
+      if (!this.persist.hasOwnProperty(port)) {
+
+        if (this.ports.input[port].indexed) {
+          if (/object/i.test(this.ports.input[port].type)) {
+            return this._objectPortIsFilled(port);
+          }
+          else {
+            return this._arrayPortIsFilled(port);
+          }
         }
-        else {
-          return this._arrayPortIsFilled(port);
+        //else if (this.input[port] === undefined) {
+        else if (!this.input.hasOwnProperty(port)) {
+          return xNode.SYNC_NOT_FILLED;
         }
-      }
-      else if (this.input[port] === undefined) {
-        return xNode.SYNC_NOT_FILLED;
+
       }
     }
   }
@@ -7125,8 +7268,10 @@ xNode.prototype._initStartPort = function() {
     debug('%s:%s initialized', this.identifier, ':start');
     this.addPort('input', ':start', {
       type: 'any',
+      name: ':start',
       rejects: 0,
-      fills: 0
+      fills: 0,
+      runCount: 0
     });
   }
 };
@@ -7282,9 +7427,17 @@ xNode.prototype.reset = function() {
 
 };
 
+xNode.prototype.unwrapPackets = function(input) {
+  var self = this;
+  return Object.keys(input).reduce(function(obj, k) {
+    obj[k] = input[k].read(self);
+    return obj;
+  }, {});
+};
+
 module.exports = xNode;
 
-},{"./connector":9,"./node/interface":17,"./packet":19,"./port":20,"./port/filler":21,"./sandbox/node":25,"./sandbox/port":26,"debug":37,"util":6}],17:[function(require,module,exports){
+},{"./connector":9,"./node/interface":17,"./packet":19,"./port":20,"./port/filler":21,"./sandbox/node":25,"./sandbox/port":26,"debug":39,"util":6}],17:[function(require,module,exports){
 'use strict';
 
 /* jshint -W040 */
@@ -7435,6 +7588,7 @@ function INode(id, node, identifier, CHI) {
   // Always add complete port, :start port will be added
   // dynamicaly
   this.ports.output[':complete'] = {
+    name: ':complete',
     type: 'any'
   };
 
@@ -7443,6 +7597,7 @@ function INode(id, node, identifier, CHI) {
   for (key in this.ports.input) {
     if (this.ports.input.hasOwnProperty(key)) {
       this.ports.input[key].fills = 0;
+      this.ports.input[key].runCount = 0;
       this.ports.input[key].rejects = 0;
     }
   }
@@ -7901,10 +8056,15 @@ INode.prototype._handleArrayPort = function(target, p) {
     // is never really filled...
     // look at that, will cause dangling data.
     if (!this.input[target.port]) {
-      this.input[target.port] = [];
+      // becomes a new packet
+      this.input[target.port] = new Packet(
+        this,
+        [],
+        'array'
+      );
     }
 
-    if (typeof this.input[target.port][target.get('index')] !== 'undefined') {
+    if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
       // input not available, it will be queued.
       // (queue manager also stores [])
       return Port.INDEX_NOT_AVAILABLE;
@@ -7916,22 +8076,25 @@ INode.prototype._handleArrayPort = function(target, p) {
         port: target.port,
         index: target.get('index')
       });
-
-      this.input[target.port][target.get('index')] = p.data;
+      // merge chi
+      this.CHI.merge(this.input[target.port].chi, p.chi, false);
+      this.input[target.port].read(this)[target.get('index')] = p.read(this);
+      // drop packet..
     }
 
     // it should at least be our length
     if (this._arrayPortIsFilled(target.port)) {
 
       // packet writing, CHECK THIS.
-      p.data = this.input[target.port]; // the array we've created.
+      // p.data = this.input[target.port]; // the array we've created.
 
       // Unmark the port as being indexed
       delete this.ports.input[target.port].indexed;
 
       // ok, above all return true or false
       // this one is either returning true or an error.
-      return this._fillPort(target, p);
+      //return this._fillPort(target, p);
+      return this._fillPort(target, this.input[target.port]);
 
     }
     else {
@@ -7977,7 +8140,11 @@ INode.prototype._handleObjectPort = function(target, p) {
 
     // Initialize empty object
     if (!this.input[target.port]) {
-      this.input[target.port] = {};
+      this.input[target.port] = new Packet(
+        this,
+        {},
+        'object'
+      );
     }
 
     // input not available, it will be queued.
@@ -7994,7 +8161,8 @@ INode.prototype._handleObjectPort = function(target, p) {
       });
 
       // define the key
-      this.input[target.port][target.get('index')] = p.data;
+      this.CHI.merge(this.input[target.port].chi, p.chi, false);
+      this.input[target.port].read(this)[target.get('index')] = p.read(this);
     }
 
     // it should at least be our length
@@ -8008,12 +8176,13 @@ INode.prototype._handleObjectPort = function(target, p) {
     if (this._objectPortIsFilled(target.port)) {
 
       // PACKET WRITING CHECK THIS.
-      p.data = this.input[target.port];
+      // p.data = this.input[target.port];
 
       // Unmark the port as being indexed
       delete this.ports.input[target.port].indexed;
 
-      return this._fillPort(target, p);
+      //return this._fillPort(target, p);
+      return this._fillPort(target, this.input[target.port]);
 
     }
     else {
@@ -8042,24 +8211,25 @@ INode.prototype._handleObjectPort = function(target, p) {
 INode.prototype._arrayPortIsFilled = function(port) {
 
   // Not even initialized
-  if (typeof this.input[port] === undefined) {
+  //if (typeof this.input[port] === undefined) {
+  if (!this.input.hasOwnProperty(port)) {
     return false;
   }
 
-  if (this.input[port].length < this._connections[port].length) {
+  if (this.input[port].read(this).length < this._connections[port].length) {
     return false;
   }
 
   // Make sure we do not have undefined (unfulfilled ports)
   // (Should not really happen)
-  for (var i = 0; i < this.input[port].length; i++) {
-    if (this.input[port][i] === undefined) {
+  for (var i = 0; i < this.input[port].read(this).length; i++) {
+    if (this.input[port].read(this)[i] === undefined) {
       return false;
     }
   }
 
   // Extra check for weird condition
-  if (this.input[port].length > this._connections[port].length) {
+  if (this.input[port].read(this).length > this._connections[port].length) {
 
     this.error(util.format(
       '%s: Array length out-of-bounds for port',
@@ -8083,25 +8253,29 @@ INode.prototype._arrayPortIsFilled = function(port) {
 INode.prototype._objectPortIsFilled = function(port) {
 
   // Not even initialized
-  if (typeof this.input[port] === undefined) {
+  //if (typeof this.input[port] === undefined) {
+  if (!this.input.hasOwnProperty(port)) {
     return false;
   }
 
   // Not all connections have provided input yet
-  if (Object.keys(this.input[port]).length < this._connections[port].length) {
+  if (Object.keys(this.input[port].read(this)).length <
+    this._connections[port].length) {
     return false;
   }
 
   // Make sure we do not have undefined (unfulfilled ports)
   // (Should not really happen)
   for (var key in this.input[port]) {
-    if (this.input[port][key] === undefined) {
+    //if (this.input[port][key] === undefined) {
+    if (this.input[port].read(this)[key] === undefined) {
       return false;
     }
   }
 
   // Extra check for weird condition
-  if (Object.keys(this.input[port]).length > this._connections[port].length) {
+  if (Object.keys(this.input[port].read(this)).length >
+    this._connections[port].length) {
 
     this.error(util.format(
       '%s: Object keys length out-of-bounds for port `%s`',
@@ -8204,10 +8378,11 @@ INode.prototype.sendPortOutput = function(port, output, chi) {
         this.outputCount++;
       }
 
-      // so basically all output is a new packet.
-      // with chi sustained or enriched.
-      var p = new Packet(output);
+      var p = this.wrapPacket(port, output);
       p.set('chi', chi);
+
+      // loose the ownership
+      p.release(this);
 
       debug('%s:%s output', this.identifier, port);
 
@@ -8609,7 +8784,7 @@ INode.prototype.inputPortAvailable = function(target) {
     }
 
     // only available if [] is not already filled.
-    if (this.input[target.port][target.get('index')] !== undefined) {
+    if (this.input[target.port].read(this)[target.get('index')] !== undefined) {
       return Port.INDEX_NOT_AVAILABLE;
     }
 
@@ -8851,9 +9026,161 @@ INode.prototype.getConnections = function() {
   return this._connections;
 };
 
+INode.prototype.determineOutputType = function(port, output, origType) {
+  var type;
+  // preferably should be used and set, maybe enforce this.
+  if (this.ports.output[port].type) {
+    return this.ports.output[port].type;
+  }
+
+  type = typeof output;
+
+  if (type !== 'object') {
+    return type;
+  }
+
+  // do not modify type, keep packet type as is
+  return origType;
+
+};
+
+// TODO: many checks only have to be determined one time.
+INode.prototype.pickPacket = function(port) {
+  if (this.input.hasOwnProperty(port)) {
+    return this.input[port];
+  } else if (this.transit.hasOwnProperty(port)) {
+    // clone
+    var c = this.transit[port].clone(this);
+    c.c--; // adjust
+    return c;
+  } else {
+    return new Packet(this, null, this.ports.input[port].type);
+    //throw Error('Unable to determine source packet');
+  }
+};
+
+INode.prototype.wrapPacket = function(port, output)  {
+  var p;
+
+  if (port[0] === ':') {
+    return new Packet(
+      this,
+      output,
+      'string'
+    );
+  }
+
+  // check 1:1 (:start && :complete) are ignored
+  var ins = Object.keys(this.ports.input).filter(function(a) {
+    return a[0] !== ':';
+  });
+  var outs = Object.keys(this.ports.output).filter(function(a) {
+    return a[0] !== ':';
+  });
+
+  if (outs.length === 1 && ins.length === 1) {
+    // assume we are doing the same packet.
+    p = this.pickPacket(ins[0]);
+    if (p) {
+      p.write(
+        this,
+        output,
+        this.determineOutputType(
+          port,
+          output,
+          p.type
+        )
+      );
+
+      this.freePort(ins[0]);
+
+    } else {
+      throw Error(
+        util.format(
+          '%s: Cannot determine packet for port `%s`, `%s` is empty',
+          this.identifier,
+          port,
+          ins[0]
+        )
+      );
+    }
+  } else if (port === 'out') {
+    if (this.ports.input.hasOwnProperty('in')) {
+      p = this.pickPacket('in');
+      if (p) {
+        p.write(
+          this,
+          output,
+          this.determineOutputType(
+            port,
+            output,
+            p.type
+          )
+        );
+        this.freePort('in');
+      } else {
+        console.log(this.export());
+        throw Error(
+          util.format(
+            '%s: Cannot determine packet for port `out`',
+            this.identifier
+          )
+        );
+      }
+    } else {
+      console.log('FAILING SOFT');
+      /* Fail soft
+      throw Error(
+        util.format(
+          '%s: Unable to find corresponding `in` port for port `out`',
+          this.identifier
+        )
+      );
+      */
+    }
+  } else if (this.inPorts.indexOf(port) >= 0) {
+    // same port name context/context
+    p = this.pickPacket(port);
+    if (p) {
+      p.write(
+        this,
+        output,
+        this.determineOutputType(
+          port,
+          output,
+          p.type
+        )
+      );
+      this.freePort(port);
+    } else {
+      throw Error(
+        util.format(
+          '%s: Cannot determine packet for outport `%s`',
+          this.identifier,
+          port
+        )
+      );
+    }
+  } else {
+    // TODO: test for ports.input.out = ['out1', 'out2']
+  }
+  if (!p) {
+    p = new Packet(
+      this,
+      output,
+      this.determineOutputType(
+        port,
+        output,
+        'any' // if all else fails
+      )
+    );
+  }
+  return p;
+};
+
 module.exports = INode;
 
-},{"../ConnectionMap":7,"../packet":19,"../port":20,"../validate":28,"chix-chi":31,"debug":37,"events":1,"util":6}],18:[function(require,module,exports){
+},{"../ConnectionMap":7,"../packet":19,"../port":20,"../validate":28,"chix-chi":31,"debug":39,"events":1,"util":6}],18:[function(require,module,exports){
 'use strict';
 
 /* global document */
@@ -9051,33 +9378,58 @@ module.exports = PolymerNode;
 },{"../packet":19,"./interface":17,"util":6}],19:[function(require,module,exports){
 'use strict';
 
+var JsonPointer = require('json-ptr');
+
 /**
  *
- * A packet wraps the data.
+ * A Packet wraps the data.
  *
- * Enabling tracking and adding metadata
+ * The packet is always owned by one owner at a time.
  *
- * Filters are not really creating new packets.
- * But modify the data.
- *
- * Maybe use getters and setters?
+ * In order to read or write a packet, the owner must identify
+ * itself first, by sending itself als a reference as first argument
+ * to any of the methods.
  *
  * var p = new Packet(data);
- *
- * drop(p);
  *
  * Packet containing it's own map of source & target.
  * Could be possible, only what will happen on split.
  *
  */
 var nr = 10000000000;
-function Packet(data, n, c) {
 
-  this.data = data;
+// temp to debug copy problem
+function Container(data) {
+  this['.'] = data;
+}
+function Packet(owner, data, type, n, c) {
+
+  this.owner = owner;
+  this.trail = [];
+  this.typeTrail = [];
+
+  if (type === undefined) {
+    throw Error('type not specified');
+  }
+
+  this.type = type;
+
+  // err ok, string must be assigned to? or {".": "string"}
+  // which means base is /. instead of ''
+  this.__data = data instanceof Container ? data : new Container(data);
   this.chi = {};
   this.nr = n ? n : nr++;
   this.c = c ? c : 0; // clone version
-  this.owner = undefined;
+  this.pointer = JsonPointer.create('/.');
+
+  Object.defineProperty(this, 'data', {
+     get: function() {
+       throw Error('data property should not be accessed');
+     },
+     set: function() {
+       throw Error('data property should not be written to');
+     }
+  });
 
   // probably too much info for a basic packet.
   // this.created_at =
@@ -9085,12 +9437,25 @@ function Packet(data, n, c) {
 
 }
 
-Packet.prototype.read = function() {
-  return this.data;
+Packet.prototype.point = function(owner, pointer) {
+  if (this.isOwner(owner)) {
+    this.pointer = JsonPointer.create('/.' + pointer);
+  }
 };
 
-Packet.prototype.write = function(data) {
-  this.data = data;
+Packet.prototype.read = function(owner) {
+  if (this.isOwner(owner)) {
+    return this.pointer.get(this.__data);
+  }
+};
+
+Packet.prototype.write = function(owner, data, type) {
+  if (this.isOwner(owner)) {
+    this.pointer.set(this.__data, data);
+    if (type) {
+      this.type = type;
+    }
+  }
 };
 
 // clone can only take place on plain object data.
@@ -9104,20 +9469,77 @@ Packet.prototype.write = function(data) {
  *
  * To enable this set cloneData to true.
  *
+ * @param {Object} owner Owner of the packet
  * @param {Boolean} cloneData Whether or not to clone the data.
  */
-Packet.prototype.clone = function(cloneData) {
-  var p = new Packet(
-    cloneData === undefined ?
-    JSON.parse(JSON.stringify(this.data)) :
-    this.data,
-    this.nr,
-    ++this.c
-  );
-  p.set('chi', JSON.parse(JSON.stringify(this.chi)));
-  return p;
+Packet.prototype.clone = function(owner) {
+  if (this.isOwner(owner)) {
+    var p = new Packet(owner,
+      null,
+      null,
+      this.nr,
+      ++this.c
+    );
+    if (!this.type) {
+      throw Error('Refusing to clone substance of unkown type');
+    }
+    // TODO: make sure String Object are always lowercase.
+    // I think they are..
+    if (this.type === 'function' || /[A-Z]/.test(this.type)) {
+      // do not clone, ownership will throw if things go wrong
+      // gah, this is hard.
+      var d = this.__data;
+      p.__data = d;
+    } else {
+      p.__data = JSON.parse(JSON.stringify(this.__data));
+    }
+    p.type = this.type;
+    p.pointer = JsonPointer.create(this.pointer.pointer);
+    p.set('chi', JSON.parse(JSON.stringify(this.chi)));
+    return p;
+  }
 };
 
+Packet.prototype.setType = function(owner, type) {
+  if (this.isOwner(owner)) {
+    this.typeTrail.push(this.type);
+    this.type = type;
+  }
+};
+
+Packet.prototype.release = function(owner) {
+  if (this.isOwner(owner)) {
+    this.trail.push(owner);
+    this.owner = undefined;
+  }
+};
+
+Packet.prototype.setOwner = function(newOwner) {
+  if (this.owner === undefined) {
+    this.owner = newOwner;
+  } else {
+    throw Error('Refusing to overwrite owner');
+  }
+};
+
+Packet.prototype.hasOwner = function() {
+  return this.owner !== undefined;
+};
+
+Packet.prototype.isOwner = function(owner) {
+  if (owner === this.owner) {
+    return true;
+  } else {
+    console.log(owner, this.owner);
+    throw Error('Packet is not owned by this instance.');
+  }
+};
+
+Packet.prototype.dump = function() {
+  return JSON.stringify(this, null, 2);
+};
+
+// Are these used?
 Packet.prototype.set = function(prop, val) {
   this[prop] = val;
 };
@@ -9136,7 +9558,7 @@ Packet.prototype.has = function(prop) {
 
 module.exports = Packet;
 
-},{}],20:[function(require,module,exports){
+},{"json-ptr":50}],20:[function(require,module,exports){
 'use strict';
 
 /**
@@ -9368,25 +9790,54 @@ module.exports = Port;
 
 var Port = require('../port');
 var util = require('util');
+var Packet = require('../packet');
 
 var portFill;
 
 module.exports = portFill = exports;
 
-exports.fill = function(ports, input, context) {
+/***
+ *  Packet
+ * - fill with persist, done
+ * - fill with context, done
+ * - fill with defaults
+ *  Object:
+ *  - enrich with defaults
+ *
+ * defaults -> context
+ * defaults -> persist
+ * defaults -> input
+ *
+ * @param {Node} node The node
+ * @param {Object} ports Input port definitions
+ * @param {Object} input Current input
+ * @param {Object} context Context
+ * @param {Object} persist Input to be persisted
+ **/
+exports.fill = function(node) {
 
   var ret;
 
+  var ports = node.ports.input;
+  // For every non-connceted port fill the defaults
   for (var port in ports) {
     if (ports.hasOwnProperty(port)) {
-      ret = portFill.defaulter(
-        port,
-        ports,
-        input,
-        context
-      );
-      if (util.isError(ret)) {
-        return ret;
+      if (node.portHasConnections(port) &&
+        !node.persist.hasOwnProperty(port)) {
+        // mainly to not fill async ports with connects
+        // but do have defaults
+        // nop
+      } else {
+
+        // seems the return is not correct no more also.
+        ret = portFill.defaulter(
+          node,
+          port,
+          []
+        );
+        if (util.isError(ret)) {
+          return ret;
+        }
       }
     }
   }
@@ -9395,118 +9846,172 @@ exports.fill = function(ports, input, context) {
 
 };
 
-exports.check = function(obj, key, input, context, persist) {
-  var ret;
-
-  if (obj[key].properties) { //
-    var init;
-
-    if (!input[key]) {
-      input[key] = {};
-      init = true;
-    }
-
-    for (var k in obj[key].properties) {
-      if (obj[key].properties.hasOwnProperty(k)) {
-
-        ret = !portFill.check(
-          obj[key].properties,
-          k,
-          input[key],
-          context ? context[key] : {},
-          persist ? persist[key] : {}
-        );
-
-        if (!ret) {
-
-          // use this again, just return the value
-          // this will have checked the nested schema definitions.
-          // return ret;
-          /*
-                  throw new Error([
-                    this.identifier + ': Cannot determine input for property:',
-                    key + '[' + k + ']'
-                  ].join(' '));
-          */
-        }
-      }
-    }
-
-    if (!Object.keys(input[key]).length && init) {
-      // remove empty object again
-      delete input[key]; // er ref will not work probably.
-    }
-
-    // not sure, but at least should be true.
-    return Port.FILLED;
-
-  }
-  else {
-
-    // check whether input was defined for this port
-    if (!input.hasOwnProperty(key)) {
-      // if there is context, use that.
-      if (context && context.hasOwnProperty(key)) {
-        input[key] = context[key];
-        return Port.CONTEXT_SET;
-        // check the existance of default (a value of null is also valid)
-      }
-      else if (persist && persist.hasOwnProperty(key)) {
-        input[key] = persist[key];
-        return Port.PERSISTED_SET;
-      }
-      else if (obj[key].hasOwnProperty('default')) {
-        input[key] = obj[key].default;
-        return Port.DEFAULT_SET;
-      }
-      else if (obj[key].required === false) {
-        // filled but empty let the node handle it.
-        input[key] = null;
-        return Port.NOT_REQUIRED;
-      }
-      else {
-        return Port.NOT_FILLED;
-      }
-
-    }
-    else {
-      return Port.FILLED;
-    }
-
-  }
-};
-
 // also fill the defaults one level deep..
 /**
  *
  * @param {string} port
  * @private
  */
-exports.defaulter = function(port, ports, input, context) {
+exports.defaulter = function(node, port, path) {
+
   if (!portFill.check(
-      ports,
+      node,
+      node.ports.input,
       port,
-      input,
-      context
-    ) && !ports[port].async) {
+      node.input,
+      node.context,
+      node.persist,
+      path
+    ) && !node.ports.input[port].async) {
 
     if (port[0] !== ':') {
       return Port.SYNC_PORTS_UNFULFILLED;
       /*
-            // fail hard
-            return Error(util.format(
-              '%s: Cannot determine input for port `%s`',
-              this.identifier,
-              port
-            ));
+        // fail hard
+        return Error(util.format(
+          '%s: Cannot determine input for port `%s`',
+          node.identifier,
+          port
+        ));
       */
-
     }
-
   }
 };
 
-},{"../port":20,"util":6}],22:[function(require,module,exports){
+/***
+ *
+ * Fills properties with defaults
+ *
+ * Note how context and persist make no sense here...
+ * It's already filled.
+ *
+ * @param node Node
+ * @param {Object} def Current object schema
+ * @param {Object} input the input to be filled
+ * @param {Object} context Current level context
+ * @param {Object} persist Current level persist
+ * @param {String} port The port
+ */
+exports.checkProperties = function(node, def, input, port) {
+  var ret;
+  for (var prop in def.properties) {
+    if (def.properties.hasOwnProperty(prop)) {
+      var property =  def.properties[prop];
+        // check the existance of default (a value of null is also valid)
+      if (!input.hasOwnProperty(prop)) {
+        if (property.hasOwnProperty('default')) {
+          input[prop] = property.default;
+        } else if (property.required === false) {
+          // filled with packet, but the value is undefined.
+          // input[key] = null; // undefined not possible at this level.
+          input[prop] = undefined; // undefined not possible at this level.
+        } else {
+
+          if (property.type === 'object') {
+            if (property.hasOwnProperty('properties')) {
+              if (!input.hasOwnProperty(prop)) {
+                // always fill with empty object?
+                input[prop] = {};
+              }
+              return this.checkProperties(node, property, input[prop], port);
+            }
+          }
+          // fail check
+          // return or throw?
+          // return throw Error(util.format(
+          throw Error(util.format(
+            '%s: Cannot determine input for port `%s`',
+            node.identifier,
+            port
+          ));
+        }
+      }
+    }
+  }
+};
+
+// first level
+/**
+ *
+ * @param node Node
+ * @param {Object} def Current object schema
+ * @param {String} port Port
+ * @param {Object} input the input to be filled
+ * @param {Object} context Current level context
+ * @param {Object} persist Current level persist
+ */
+exports.check = function(node, def, port, input, context, persist) {
+
+  var ret;
+
+  // check whether input was defined for this port
+  if (!input.hasOwnProperty(port)) {
+
+    // This will not really work for persisted indexes
+    // or at least it should check whether the array is full after
+    // this fill
+    ret = Port.NOT_FILLED;
+    if (persist && persist.hasOwnProperty(port)) {
+      input[port] = persist[port].clone(node);
+      ret = Port.PERSISTED_SET;
+    } else if (context && context.hasOwnProperty(port)) {
+      // if there is context, use that.
+      input[port] = context[port].clone(node);
+      ret = Port.CONTEXT_SET;
+      // check the existance of default (a value of null is also valid)
+    } else if (def[port].hasOwnProperty('default')) {
+      input[port] = new Packet(
+        node,
+        def[port].default,
+        node.getPortType(port)
+      );
+      ret = Port.DEFAULT_SET;
+    } else if (def[port].required === false) {
+      // filled with packet, but the value is undefined.
+      input[port] = new Packet(
+        node,
+        undefined,
+        node.getPortType(port)
+      );
+      ret = Port.NOT_REQUIRED;
+    }
+
+    // if it's an object, fill in defaults
+    if (def[port].properties) { //
+      var init;
+      // initialize packet on the first level
+      if (!input[port]) {
+        init = true;
+        input[port] = new Packet(node, {}, 'object');
+      }
+
+      portFill.checkProperties(
+        node,
+        def[port],
+        input[port].read(node),
+        port
+      );
+
+      // TODO: check ret value correctness
+      if (!Object.keys(input[port].read(node)).length && init) {
+        // remove empty packet again
+        delete input[port];
+        ret = PORT.NOT_FILLED;
+      } else {
+        ret = Port.FILLED;
+      }
+
+    }
+
+    return ret;
+
+  }
+  else {
+    return Port.FILLED;
+  }
+
+};
+},{"../packet":19,"../port":20,"util":6}],22:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -9827,7 +10332,7 @@ ProcessManager.prototype.filterBy = function(prop, value) {
 module.exports = ProcessManager;
 
 }).call(this,require("uojqOp"))
-},{"events":1,"uojqOp":4,"util":6,"uuid":49}],23:[function(require,module,exports){
+},{"events":1,"uojqOp":4,"util":6,"uuid":52}],23:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -10188,7 +10693,7 @@ QueueManager.prototype.getQueues = function() {
 
 module.exports = QueueManager;
 
-},{"debug":37,"util":6}],24:[function(require,module,exports){
+},{"debug":39,"util":6}],24:[function(require,module,exports){
 'use strict';
 
 var DefaultContextProvider = require('./context/defaultProvider');
@@ -10502,7 +11007,7 @@ NodeBox.prototype.run = function(bind) {
 module.exports = NodeBox;
 
 }).call(this,require("uojqOp"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"iobox":41,"path":3,"uojqOp":4,"util":6}],26:[function(require,module,exports){
+},{"iobox":43,"path":3,"uojqOp":4,"util":6}],26:[function(require,module,exports){
 'use strict';
 
 var NodeBox = require('./node');
@@ -10839,7 +11344,7 @@ module.exports = {
   nodeDefinitions: _checkIds
 };
 
-},{"../schemas/link.json":50,"../schemas/map.json":51,"../schemas/node.json":52,"instance-of":40,"is-plain-object":42,"json-gate":45}],"chix-flow":[function(require,module,exports){
+},{"../schemas/link.json":53,"../schemas/map.json":54,"../schemas/node.json":55,"instance-of":42,"is-plain-object":44,"json-gate":47}],"chix-flow":[function(require,module,exports){
 module.exports=require('jXAsbI');
 },{}],"jXAsbI":[function(require,module,exports){
 'use strict';
@@ -10866,7 +11371,7 @@ module.exports = {
   }
 };
 
-},{"./lib/actor":8,"./lib/flow":11,"./lib/link":14,"./lib/node":16,"./lib/validate":28,"./schemas/map.json":51,"./schemas/node.json":52,"./schemas/stage.json":53}],31:[function(require,module,exports){
+},{"./lib/actor":8,"./lib/flow":11,"./lib/link":14,"./lib/node":16,"./lib/validate":28,"./schemas/map.json":54,"./schemas/node.json":55,"./schemas/stage.json":56}],31:[function(require,module,exports){
 'use strict';
 
 var util         = require('util');
@@ -11039,7 +11544,7 @@ CHI.prototype.collect = function(link, p) {
 
   // only push the data, last packet is re-used
   // to write the data back.
-  this.queue[link.ioid][gid].push(p.data);
+  this.queue[link.ioid][gid].push(p.read());
 
   //this.readySend(link, gid, chi);
   this.readySend(link, gid, p);
@@ -11282,7 +11787,7 @@ Group.prototype.gid = function() {
 
 module.exports = Group;
 
-},{"events":1,"util":6,"uuid":49}],33:[function(require,module,exports){
+},{"events":1,"util":6,"uuid":37}],33:[function(require,module,exports){
 'use strict';
 
 var uuid = require('uuid').v4;
@@ -11344,7 +11849,7 @@ PortPointer.prototype.add = function(port) {
 
 module.exports = PortPointer;
 
-},{"uuid":49}],34:[function(require,module,exports){
+},{"uuid":37}],34:[function(require,module,exports){
 'use strict';
 
 ////
@@ -11502,6 +12007,226 @@ Store.prototype.isEmpty = function() {
 module.exports = Store;
 
 },{}],36:[function(require,module,exports){
+(function (global){
+
+var rng;
+
+if (global.crypto && crypto.getRandomValues) {
+  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
+  // Moderately fast, high quality
+  var _rnds8 = new Uint8Array(16);
+  rng = function whatwgRNG() {
+    crypto.getRandomValues(_rnds8);
+    return _rnds8;
+  };
+}
+
+if (!rng) {
+  // Math.random()-based (RNG)
+  //
+  // If all else fails, use Math.random().  It's fast, but is of unspecified
+  // quality.
+  var  _rnds = new Array(16);
+  rng = function() {
+    for (var i = 0, r; i < 16; i++) {
+      if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
+      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
+    }
+
+    return _rnds;
+  };
+}
+
+module.exports = rng;
+
+
+}).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{}],37:[function(require,module,exports){
+//     uuid.js
+//
+//     Copyright (c) 2010-2012 Robert Kieffer
+//     MIT License - http://opensource.org/licenses/mit-license.php
+
+// Unique ID creation requires a high quality random # generator.  We feature
+// detect to determine the best RNG source, normalizing to a function that
+// returns 128-bits of randomness, since that's what's usually required
+var _rng = require('./rng');
+
+// Maps for number <-> hex string conversion
+var _byteToHex = [];
+var _hexToByte = {};
+for (var i = 0; i < 256; i++) {
+  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
+  _hexToByte[_byteToHex[i]] = i;
+}
+
+// **`parse()` - Parse a UUID into it's component bytes**
+function parse(s, buf, offset) {
+  var i = (buf && offset) || 0, ii = 0;
+
+  buf = buf || [];
+  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
+    if (ii < 16) { // Don't overflow!
+      buf[i + ii++] = _hexToByte[oct];
+    }
+  });
+
+  // Zero out remaining bytes if string was short
+  while (ii < 16) {
+    buf[i + ii++] = 0;
+  }
+
+  return buf;
+}
+
+// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
+function unparse(buf, offset) {
+  var i = offset || 0, bth = _byteToHex;
+  return  bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] + '-' +
+          bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]] +
+          bth[buf[i++]] + bth[buf[i++]];
+}
+
+// **`v1()` - Generate time-based UUID**
+//
+// Inspired by https://github.com/LiosK/UUID.js
+// and http://docs.python.org/library/uuid.html
+
+// random #'s we need to init node and clockseq
+var _seedBytes = _rng();
+
+// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+var _nodeId = [
+  _seedBytes[0] | 0x01,
+  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
+];
+
+// Per 4.2.2, randomize (14 bit) clockseq
+var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
+
+// Previous uuid creation time
+var _lastMSecs = 0, _lastNSecs = 0;
+
+// See https://github.com/broofa/node-uuid for API details
+function v1(options, buf, offset) {
+  var i = buf && offset || 0;
+  var b = buf || [];
+
+  options = options || {};
+
+  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
+
+  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
+  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
+
+  // Per 4.2.1.2, use count of uuid's generated during the current clock
+  // cycle to simulate higher resolution clock
+  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
+
+  // Time since last uuid creation (in msecs)
+  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
+
+  // Per 4.2.1.2, Bump clockseq on clock regression
+  if (dt < 0 && options.clockseq === undefined) {
+    clockseq = clockseq + 1 & 0x3fff;
+  }
+
+  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+  // time interval
+  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
+    nsecs = 0;
+  }
+
+  // Per 4.2.1.2 Throw error if too many uuids are requested
+  if (nsecs >= 10000) {
+    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
+  }
+
+  _lastMSecs = msecs;
+  _lastNSecs = nsecs;
+  _clockseq = clockseq;
+
+  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+  msecs += 12219292800000;
+
+  // `time_low`
+  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+  b[i++] = tl >>> 24 & 0xff;
+  b[i++] = tl >>> 16 & 0xff;
+  b[i++] = tl >>> 8 & 0xff;
+  b[i++] = tl & 0xff;
+
+  // `time_mid`
+  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
+  b[i++] = tmh >>> 8 & 0xff;
+  b[i++] = tmh & 0xff;
+
+  // `time_high_and_version`
+  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+  b[i++] = tmh >>> 16 & 0xff;
+
+  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+  b[i++] = clockseq >>> 8 | 0x80;
+
+  // `clock_seq_low`
+  b[i++] = clockseq & 0xff;
+
+  // `node`
+  var node = options.node || _nodeId;
+  for (var n = 0; n < 6; n++) {
+    b[i + n] = node[n];
+  }
+
+  return buf ? buf : unparse(b);
+}
+
+// **`v4()` - Generate random UUID**
+
+// See https://github.com/broofa/node-uuid for API details
+function v4(options, buf, offset) {
+  // Deprecated - 'format' argument, as supported in v1.2
+  var i = buf && offset || 0;
+
+  if (typeof(options) == 'string') {
+    buf = options == 'binary' ? new Array(16) : null;
+    options = null;
+  }
+  options = options || {};
+
+  var rnds = options.random || (options.rng || _rng)();
+
+  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+  rnds[6] = (rnds[6] & 0x0f) | 0x40;
+  rnds[8] = (rnds[8] & 0x3f) | 0x80;
+
+  // Copy bytes to buffer, if provided
+  if (buf) {
+    for (var ii = 0; ii < 16; ii++) {
+      buf[i + ii] = rnds[ii];
+    }
+  }
+
+  return buf || unparse(rnds);
+}
+
+// Export public API
+var uuid = v4;
+uuid.v1 = v1;
+uuid.v4 = v4;
+uuid.parse = parse;
+uuid.unparse = unparse;
+
+module.exports = uuid;
+
+},{"./rng":36}],38:[function(require,module,exports){
 'use strict';
 
 var EventEmitter = require('events').EventEmitter;
@@ -11538,7 +12263,7 @@ function Loader() {
    *    }
    *
    *  }
-   *
+   *G
    * }
    *
    */
@@ -12201,7 +12926,7 @@ Loader.prototype.getNodeDefinitions = function(provider) {
 
 module.exports = Loader;
 
-},{"events":1,"util":6}],37:[function(require,module,exports){
+},{"events":1,"util":6}],39:[function(require,module,exports){
 
 /**
  * This is the web browser implementation of `debug()`.
@@ -12215,17 +12940,6 @@ exports.formatArgs = formatArgs;
 exports.save = save;
 exports.load = load;
 exports.useColors = useColors;
-
-/**
- * Use chrome.storage.local if we are in an app
- */
-
-var storage;
-
-if (typeof chrome !== 'undefined' && typeof chrome.storage !== 'undefined')
-  storage = chrome.storage.local;
-else
-  storage = window.localStorage;
 
 /**
  * Colors.
@@ -12316,10 +13030,10 @@ function formatArgs() {
  */
 
 function log() {
-  // this hackery is required for IE8/9, where
-  // the `console.log` function doesn't have 'apply'
-  return 'object' === typeof console
-    && console.log
+  // This hackery is required for IE8,
+  // where the `console.log` function doesn't have 'apply'
+  return 'object' == typeof console
+    && 'function' == typeof console.log
     && Function.prototype.apply.call(console.log, console, arguments);
 }
 
@@ -12333,9 +13047,9 @@ function log() {
 function save(namespaces) {
   try {
     if (null == namespaces) {
-      storage.removeItem('debug');
+      localStorage.removeItem('debug');
     } else {
-      storage.debug = namespaces;
+      localStorage.debug = namespaces;
     }
   } catch(e) {}
 }
@@ -12350,7 +13064,7 @@ function save(namespaces) {
 function load() {
   var r;
   try {
-    r = storage.debug;
+    r = localStorage.debug;
   } catch(e) {}
   return r;
 }
@@ -12361,7 +13075,7 @@ function load() {
 
 exports.enable(load());
 
-},{"./debug":38}],38:[function(require,module,exports){
+},{"./debug":40}],40:[function(require,module,exports){
 
 /**
  * This is the common logic for both the Node.js and web browser
@@ -12560,7 +13274,7 @@ function coerce(val) {
   return val;
 }
 
-},{"ms":39}],39:[function(require,module,exports){
+},{"ms":41}],41:[function(require,module,exports){
 /**
  * Helpers.
  */
@@ -12673,7 +13387,7 @@ function plural(ms, n, name) {
   return Math.ceil(ms / n) + ' ' + name + 's';
 }
 
-},{}],40:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 module.exports = function InstanceOf(obj, type) {
   if(obj === null) return false;
   if(type === 'array') type = 'Array';
@@ -12688,7 +13402,7 @@ module.exports = function InstanceOf(obj, type) {
   }
 };
 
-},{}],41:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 'use strict';
 
 var util = require('util');
@@ -12965,7 +13679,7 @@ IOBox.prototype.run = function (bind) {
 
 module.exports = IOBox;
 
-},{"events":1,"util":6}],42:[function(require,module,exports){
+},{"events":1,"util":6}],44:[function(require,module,exports){
 /*!
  * is-plain-object <https://github.com/jonschlinkert/is-plain-object>
  *
@@ -12978,7 +13692,7 @@ module.exports = IOBox;
 module.exports = function isPlainObject(o) {
   return !!o && typeof o === 'object' && o.constructor === Object;
 };
-},{}],43:[function(require,module,exports){
+},{}],45:[function(require,module,exports){
 exports.getType = function (obj) {
 	switch (Object.prototype.toString.call(obj)) {
 		case '[object String]':
@@ -13079,7 +13793,7 @@ exports.deepEquals = function (obj1, obj2) {
 	}
 };
 
-},{}],44:[function(require,module,exports){
+},{}],46:[function(require,module,exports){
 var RE_0_TO_100 = '([1-9]?[0-9]|100)';
 var RE_0_TO_255 = '([1-9]?[0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])';
 
@@ -13175,7 +13889,7 @@ var formats = {
 
 exports.formats = formats;
 
-},{}],45:[function(require,module,exports){
+},{}],47:[function(require,module,exports){
 var validateSchema = require('./valid-schema'),
 	validateObject = require('./valid-object');
 
@@ -13192,7 +13906,7 @@ module.exports.createSchema = function (schema) {
 	return new Schema(schema);
 }
 
-},{"./valid-object":46,"./valid-schema":47}],46:[function(require,module,exports){
+},{"./valid-object":48,"./valid-schema":49}],48:[function(require,module,exports){
 var formats = require('./formats').formats;
 var common = require('./common'),
 	getType = common.getType,
@@ -13577,7 +14291,7 @@ module.exports = function(obj, schema, done) {
 	}
 };
 
-},{"./common":43,"./formats":44}],47:[function(require,module,exports){
+},{"./common":45,"./formats":46}],49:[function(require,module,exports){
 var formats = require('./formats').formats;
 var common = require('./common'),
 	getType = common.getType,
@@ -13859,227 +14573,321 @@ module.exports = function(schema) {
 	validateSchema(schema, []);
 };
 
-},{"./common":43,"./formats":44,"./valid-object":46}],48:[function(require,module,exports){
+},{"./common":45,"./formats":46,"./valid-object":48}],50:[function(require,module,exports){
 (function (global){
+/* jshint laxbreak: true, laxcomma: true*/
+/* global global, window */
 
-var rng;
+(function (undefined) {
+	"use strict";
 
-if (global.crypto && crypto.getRandomValues) {
-  // WHATWG crypto-based RNG - http://wiki.whatwg.org/wiki/Crypto
-  // Moderately fast, high quality
-  var _rnds8 = new Uint8Array(16);
-  rng = function whatwgRNG() {
-    crypto.getRandomValues(_rnds8);
-    return _rnds8;
-  };
-}
+	var $scope
+	, conflict, conflictResolution = [];
+	if (typeof global === 'object' && global) {
+		$scope = global;
+		conflict = global.JsonPointer;
+	} else if (typeof window !== 'undefined') {
+		$scope = window;
+		conflict = window.JsonPointer;
+	} else {
+		$scope = {};
+	}
+	if (conflict) {
+		conflictResolution.push(
+			function () {
+				if ($scope.JsonPointer === JsonPointer) {
+					$scope.JsonPointer = conflict;
+					conflict = undefined;
+				}
+			});
+	}
 
-if (!rng) {
-  // Math.random()-based (RNG)
-  //
-  // If all else fails, use Math.random().  It's fast, but is of unspecified
-  // quality.
-  var  _rnds = new Array(16);
-  rng = function() {
-    for (var i = 0, r; i < 16; i++) {
-      if ((i & 0x03) === 0) r = Math.random() * 0x100000000;
-      _rnds[i] = r >>> ((i & 0x03) << 3) & 0xff;
-    }
+	function decodePointer(ptr) {
+		if (typeof ptr !== 'string') { throw new TypeError('Invalid type: JSON Pointers are represented as strings.'); }
+		if (ptr.length === 0) { return []; }
+		if (ptr[0] !== '/') { throw new ReferenceError('Invalid JSON Pointer syntax. Non-empty pointer must begin with a solidus `/`.'); }
+		var path = ptr.substring(1).split('/')
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			path[i] = path[i].replace('~1', '/').replace('~0', '~');
+		}
+		return path;
+	}
 
-    return _rnds;
-  };
-}
+	function encodePointer(path) {
+		if (path && !Array.isArray(path)) { throw new TypeError('Invalid type: path must be an array of segments.'); }
+		if (path.length === 0) { return ''; }
+		var res = []
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			if (typeof path[i] === 'string') {
+				res.push(path[i].replace('~', '~0').replace('/', '~1'));
+			} else {
+				res.push(path[i]);
+			}
+		}
+		return "/".concat(res.join('/'));
+	}
 
-module.exports = rng;
+	function decodeUriFragmentIdentifier(ptr) {
+		if (typeof ptr !== 'string') { throw new TypeError('Invalid type: JSON Pointers are represented as strings.'); }
+		if (ptr.length === 0 || ptr[0] !== '#') { throw new ReferenceError('Invalid JSON Pointer syntax; URI fragment idetifiers must begin with a hash.'); }
+		if (ptr.length === 1) { return []; }
+		if (ptr[1] !== '/') { throw new ReferenceError('Invalid JSON Pointer syntax.'); }
+		var path = ptr.substring(2).split('/')
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			path[i] = decodeURIComponent(path[i]).replace('~1', '/').replace('~0', '~');
+		}
+		return path;
+	}
 
+	function encodeUriFragmentIdentifier(path) {
+		if (path && !Array.isArray(path)) { throw new TypeError('Invalid type: path must be an array of segments.'); }
+		if (path.length === 0) { return '#'; }
+		var res = []
+		, i = -1
+		, len = path.length
+		;
+		while (++i < len) {
+			var segment = '' + path[i];
+			res.push(encodeURIComponent(segment.replace('~', '~0').replace('/', '~1')));
+		}
+		return "#/".concat(res.join('/'));
+	}
+
+	function toArrayIndexReference(arr, idx) {
+		var len = idx.length
+		, cursor = 0
+		;
+		if (len === 0 || len > 1 && idx[0] === '0')  { return -1; }
+		if (len === 1 && idx[0] === '-') { return arr.length; }
+
+		while (++cursor < len) {
+			if (idx[cursor] < '0' || idx[cursor] > '9') { return -1; }
+		}
+		return parseInt(idx, 10);
+	}
+
+	function list(obj, observe, path, key, stack, ptrs) {
+		var i, len;
+		path = path || [];
+		var currentPath = path.slice(0);
+		if (typeof key !== 'undefined') {
+			currentPath.push(key);
+		}
+		var type = typeof obj;
+		if (type === 'undefined') {
+			return; // should only happen at the top level.
+		} else {
+			var ptr = encodeUriFragmentIdentifier(currentPath);
+			if (type === 'object' && obj !== null) {
+				stack = stack || [];
+				ptrs = ptrs || [];
+				var circ = stack.indexOf(obj);
+				if (circ < 0) {
+					stack.push(obj);
+					ptrs.push(ptr);
+					observe({
+						fragmentId: ptr,
+						value: obj
+					});
+					if (Array.isArray(obj)) {
+						i = -1;
+						len = obj.length;
+						while (++i < len) {
+							list(obj[i], observe, currentPath, i, stack, ptrs);
+						}
+					} else {
+						var props = Object.getOwnPropertyNames(obj);
+						i = -1;
+						len = props.length;
+						while (++i < len) {
+							list(obj[props[i]], observe, currentPath, props[i], stack, ptrs);
+						}
+					}
+					stack.length = stack.length - 1;
+					ptrs.length = ptrs.length - 1;
+				} else {
+					observe({
+						fragmentId: ptr,
+						value: { '$ref': ptrs[circ] },
+						circular: true
+					});
+				}
+			} else {
+				observe({
+					fragmentId: ptr,
+					value: obj
+				});
+			}
+		}
+	}
+
+	function get(obj, path) {
+		if (typeof obj !== 'undefined') {
+			var it = obj
+			, len = path.length
+			, cursor = -1
+			, step, p;
+			if (len) {
+				while (++cursor < len && it) {
+					step = path[cursor];
+					if (Array.isArray(it)) {
+						if (isNaN(step)) {
+							return;
+						}
+						p = toArrayIndexReference(it, step);
+						if (it.length > p) {
+							it = it[p];
+						} else {
+							return;
+						}
+					} else {
+						it = it[step];
+					}
+				}
+				return it;
+			} else {
+				return obj;
+			}
+		}
+	}
+
+	function set(obj, val, path, enc) {
+		if (path.length === 0) { throw new Error("Cannot set the root object; assign it directly."); }
+		if (typeof obj !== 'undefined') {
+			var it = obj
+			, len = path.length
+			, end = path.length - 1
+			, cursor = -1
+			, step, p, rem;
+			if (len) {
+				while (++cursor < len) {
+					step = path[cursor];
+					if (Array.isArray(it)) {
+						p = toArrayIndexReference(it, step);
+						if (it.length > p) {
+							if (cursor === end) {
+								rem = it[p];
+								it[p] = val;
+								return rem;
+							}
+							it = it[p];
+						} else if (it.length === p) {
+							it.push(val);
+							return undefined;
+						} else {
+							throw new ReferenceError("Not found: "
+								.concat(enc(path.slice(0, cursor + 1), true), '.'));
+						}
+					} else {
+						if (cursor === end) {
+							rem = it[step];
+							it[step] = val;
+							return rem;
+						}
+						it = it[step];
+						if (typeof it === 'undefined') {
+							throw new ReferenceError("Not found: "
+								.concat(enc(path.slice(0, cursor + 1), true), '.'));
+						}
+					}
+				}
+				if (cursor === len) {
+					return it;
+				}
+			} else {
+				return it;
+			}
+		}
+	}
+
+	function JsonPointer(ptr) {
+		this.encode = (ptr.length > 0 && ptr[0] === '#') ? encodeUriFragmentIdentifier : encodePointer;
+		if (Array.isArray(ptr)) {
+			this.path = ptr;
+		} else {
+			var decode = (ptr.length > 0 && ptr[0] === '#') ? decodeUriFragmentIdentifier : decodePointer;
+			this.path = decode(ptr);
+		}
+	}
+
+	Object.defineProperty(JsonPointer.prototype, 'pointer', {
+		enumerable: true,
+		get: function () { return encodePointer(this.path); }
+	});
+
+	Object.defineProperty(JsonPointer.prototype, 'uriFragmentIdentifier', {
+		enumerable: true,
+		get: function () { return encodeUriFragmentIdentifier(this.path); }
+	});
+
+	JsonPointer.prototype.get = function (obj) {
+		return get(obj, this.path);
+	};
+
+	JsonPointer.prototype.set = function (obj, val) {
+		return set(obj, val, this.path, this.encode);
+	};
+
+	JsonPointer.prototype.toString = function () {
+		return this.pointer;
+	};
+
+	JsonPointer.create = function (ptr) { return new JsonPointer(ptr); };
+	JsonPointer.get = function (obj, ptr) {
+		var decode = (ptr.length > 0 && ptr[0] === '#') ? decodeUriFragmentIdentifier : decodePointer;
+		return get(obj, decode(ptr));
+	};
+	JsonPointer.set = function (obj, ptr, val) {
+		var encode = (ptr.length > 0 && ptr[0] === '#') ? encodeUriFragmentIdentifier : encodePointer;
+		var decode = (ptr.length > 0 && ptr[0] === '#') ? decodeUriFragmentIdentifier : decodePointer;
+
+		return set(obj, val, decode(ptr), encode);
+	};
+	JsonPointer.list = function (obj, observe) {
+		var res = [];
+		observe = observe || function (observation) {
+			res.push(observation);
+		};
+		list(obj, observe);
+		if (res.length) {
+			return res;
+		}
+	};
+	JsonPointer.decodePointer = decodePointer;
+	JsonPointer.encodePointer = encodePointer;
+	JsonPointer.decodeUriFragmentIdentifier = decodeUriFragmentIdentifier;
+	JsonPointer.encodeUriFragmentIdentifier = encodeUriFragmentIdentifier;
+
+	JsonPointer.noConflict = function () {
+		if (conflictResolution) {
+			conflictResolution.forEach(function (it) { it(); });
+			conflictResolution = null;
+		}
+		return JsonPointer;
+	};
+
+	if (typeof module !== 'undefined' && module && typeof exports === 'object' && exports && module.exports === exports) {
+		module.exports = JsonPointer; // nodejs
+	} else {
+		$scope.JsonPointer = JsonPointer; // other... browser?
+	}
+}());
 
 }).call(this,typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],49:[function(require,module,exports){
-//     uuid.js
-//
-//     Copyright (c) 2010-2012 Robert Kieffer
-//     MIT License - http://opensource.org/licenses/mit-license.php
-
-// Unique ID creation requires a high quality random # generator.  We feature
-// detect to determine the best RNG source, normalizing to a function that
-// returns 128-bits of randomness, since that's what's usually required
-var _rng = require('./rng');
-
-// Maps for number <-> hex string conversion
-var _byteToHex = [];
-var _hexToByte = {};
-for (var i = 0; i < 256; i++) {
-  _byteToHex[i] = (i + 0x100).toString(16).substr(1);
-  _hexToByte[_byteToHex[i]] = i;
-}
-
-// **`parse()` - Parse a UUID into it's component bytes**
-function parse(s, buf, offset) {
-  var i = (buf && offset) || 0, ii = 0;
-
-  buf = buf || [];
-  s.toLowerCase().replace(/[0-9a-f]{2}/g, function(oct) {
-    if (ii < 16) { // Don't overflow!
-      buf[i + ii++] = _hexToByte[oct];
-    }
-  });
-
-  // Zero out remaining bytes if string was short
-  while (ii < 16) {
-    buf[i + ii++] = 0;
-  }
-
-  return buf;
-}
-
-// **`unparse()` - Convert UUID byte array (ala parse()) into a string**
-function unparse(buf, offset) {
-  var i = offset || 0, bth = _byteToHex;
-  return  bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] + '-' +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]] +
-          bth[buf[i++]] + bth[buf[i++]];
-}
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-// random #'s we need to init node and clockseq
-var _seedBytes = _rng();
-
-// Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-var _nodeId = [
-  _seedBytes[0] | 0x01,
-  _seedBytes[1], _seedBytes[2], _seedBytes[3], _seedBytes[4], _seedBytes[5]
-];
-
-// Per 4.2.2, randomize (14 bit) clockseq
-var _clockseq = (_seedBytes[6] << 8 | _seedBytes[7]) & 0x3fff;
-
-// Previous uuid creation time
-var _lastMSecs = 0, _lastNSecs = 0;
-
-// See https://github.com/broofa/node-uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  }
-
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  }
-
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
-
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  var node = options.node || _nodeId;
-  for (var n = 0; n < 6; n++) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : unparse(b);
-}
-
-// **`v4()` - Generate random UUID**
-
-// See https://github.com/broofa/node-uuid for API details
-function v4(options, buf, offset) {
-  // Deprecated - 'format' argument, as supported in v1.2
-  var i = buf && offset || 0;
-
-  if (typeof(options) == 'string') {
-    buf = options == 'binary' ? new Array(16) : null;
-    options = null;
-  }
-  options = options || {};
-
-  var rnds = options.random || (options.rng || _rng)();
-
-  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-  rnds[6] = (rnds[6] & 0x0f) | 0x40;
-  rnds[8] = (rnds[8] & 0x3f) | 0x80;
-
-  // Copy bytes to buffer, if provided
-  if (buf) {
-    for (var ii = 0; ii < 16; ii++) {
-      buf[i + ii] = rnds[ii];
-    }
-  }
-
-  return buf || unparse(rnds);
-}
-
-// Export public API
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-uuid.parse = parse;
-uuid.unparse = unparse;
-
-module.exports = uuid;
-
-},{"./rng":48}],50:[function(require,module,exports){
+},{}],51:[function(require,module,exports){
+module.exports=require(36)
+},{}],52:[function(require,module,exports){
+module.exports=require(37)
+},{"./rng":51}],53:[function(require,module,exports){
 module.exports={
   "type": "object",
   "title": "Chiχ Link",
@@ -14156,7 +14964,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],51:[function(require,module,exports){
+},{}],54:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Map",
@@ -14308,7 +15116,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],52:[function(require,module,exports){
+},{}],55:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Nodes",
@@ -14389,7 +15197,7 @@ module.exports={
   "additionalProperties": false
 }
 
-},{}],53:[function(require,module,exports){
+},{}],56:[function(require,module,exports){
 module.exports={
   "type":"object",
   "title":"Chiχ Stage",
@@ -14485,7 +15293,230 @@ module.exports={
   }
 }
 
-},{}],"UsqOEx":[function(require,module,exports){
+},{}],57:[function(require,module,exports){
+'use strict';
+
+/**
+ *
+ * Ok, this should be a general listener interface.
+ *
+ * One who will use it is the Actor.
+ * But I want to be able to do the same for e.g. Loader.
+ *
+ * They will all be in chix-monitor-*
+ *
+ * npmlog =  Listener(instance, options);
+ *
+ * The return is just in case you want to do other stuff.
+ *
+ * e.g. fbpx wants to add this to npmlog:
+ *
+ * Logger.level = program.verbose ? 'verbose' : program.debug;
+ *
+ */
+// function NpmLogActorMonitor(actor, opts) {
+module.exports = function NpmLogActorMonitor(Logger, actor) {
+
+   // TODO: just make an NpmLogIOMonitor.
+   var ioHandler = actor.ioHandler;
+
+   actor.on('removeLink', function(event) {
+     Logger.debug(
+       event.node ? event.node.identifier : 'Some Actor',
+       'removed link'
+     );
+   });
+
+   // Ok emiting each and every output I don't like for the IOHandler.
+   // but whatever can change it later.
+   ioHandler.on('output', function(data) {
+
+     // I don't like this data.out.port thing vs data.port
+     switch(data.port) {
+
+        case ':plug':
+         Logger.debug(
+           data.node.identifier,
+           'port %s plugged (%d)',
+           data.out.read().port,
+           data.out.read().connections);
+        break;
+
+        case ':unplug':
+         Logger.debug(
+           data.node.identifier,
+           'port %s unplugged (%d)',
+           data.out.read().port,
+           data.out.read().connections);
+        break;
+
+        case ':portFill':
+         Logger.info(
+           data.node.identifier,
+           'port %s filled with data',
+           data.out.read().port);
+        break;
+
+        case ':contextUpdate':
+         Logger.info(
+           data.node.identifier,
+           'port %s filled with context',
+           data.out.read().port);
+        break;
+
+        case ':inputValidated':
+          Logger.debug(data.node.identifier, 'input validated');
+        break;
+
+        case ':start':
+          Logger.info(data.node.identifier, 'START');
+        break;
+
+        case ':freePort':
+          Logger.debug(data.node.identifier, 'free port %s', data.out.read().port);
+        break;
+
+/*
+       case ':queue':
+         Logger.debug(
+           data.node,
+           'queue: %s',
+           data.port
+         );
+       break;
+*/
+
+       case ':openPort':
+         Logger.info(
+           data.node.identifier,
+           'opened port %s (%d)',
+           data.out.read().port,
+           data.out.read().connections
+           );
+       break;
+
+       case ':closePort':
+         Logger.info(
+           data.node.identifier,
+           'closed port %s',
+           data.out.read().port
+           );
+       break;
+
+       case ':index':
+         Logger.info(
+           data.node.identifier,
+           '[%s] set on port `%s`',
+           data.out.read().index,
+           data.out.read().port
+           );
+       break;
+
+       case ':nodeComplete':
+         // console.log('nodeComplete', data);
+         Logger.info(data.node.identifier, 'completed');
+       break;
+
+       case ':portReject':
+         Logger.warn(
+           data.node.identifier,
+           'rejected input on port %s',
+           data.out.read().port
+         );
+       break;
+
+       case ':inputRequired':
+         Logger.error(
+           data.node.identifier,
+           'input required on port %s',
+           data.out.read().port);
+       break;
+
+       case ':error':
+       case 'error':
+         Logger.error(
+           data.node.identifier,
+           data.out.read().msg
+         );
+       break;
+
+       case ':nodeTimeout':
+         Logger.error(
+           data.node.identifier,
+           'node timeout'
+         );
+       break;
+
+       case ':executed':
+         Logger.info(
+           data.node.identifier,
+           'EXECUTED'
+         );
+       break;
+
+       case ':inputTimeout':
+         Logger.info(
+           data.node.identifier,
+           'input timeout, got %s need %s',
+           Object.keys(data.node.input).join(', '),
+           data.node.openPorts.join(', '));
+       break;
+
+       default:
+         // TODO: if the above misses a system port it will be reported
+         //       as default normal output.
+         Logger.info(data.node.identifier, 'output on port %s', data.port);
+       break;
+
+     }
+
+   });
+
+   return Logger;
+
+};
+
+},{}],58:[function(require,module,exports){
+'use strict';
+
+/**
+ *
+ * NpmLog monitor for the Loader
+ *
+ */
+module.exports = function NpmLogLoaderMonitor(Logger, loader) {
+
+  loader.on('loadUrl', function(data) {
+    Logger.info( 'loadUrl', data.url);
+  });
+
+  loader.on('loadFile', function(data) {
+    Logger.info( 'loadFile', data.path);
+  });
+
+  loader.on('loadCache', function(data) {
+    Logger.debug( 'cache', 'loaded cache file %s', data.file);
+  });
+
+  loader.on('purgeCache', function(data) {
+    Logger.debug( 'cache', 'purged cache file %s', data.file);
+  });
+
+  loader.on('writeCache', function(data) {
+    Logger.debug( 'cache', 'wrote cache file %s', data.file);
+  });
+
+  return Logger;
+
+};
+
+},{}],"chix-monitor-npmlog":[function(require,module,exports){
+module.exports=require('HNG52E');
+},{}],"HNG52E":[function(require,module,exports){
+exports.Actor = require('./lib/actor');
+exports.Loader = require('./lib/loader');
+
+},{"./lib/actor":57,"./lib/loader":58}],"UsqOEx":[function(require,module,exports){
 
 /**
  * Expose `parse`.
@@ -14861,12 +15892,14 @@ DotObject.prototype.set = function(path, val, obj, merge) {
 
 module.exports = DotObject;
 
+},{}],"json-editor":[function(require,module,exports){
+module.exports=require('pRDjjY');
 },{}],"pRDjjY":[function(require,module,exports){
-/*! JSON Editor v0.7.14 - JSON Schema -> HTML Editor
+/*! JSON Editor v0.7.13 - JSON Schema -> HTML Editor
  * By Jeremy Dorn - https://github.com/jdorn/json-editor/
  * Released under the MIT license
  *
- * Date: 2015-01-25
+ * Date: 2014-11-11
  */
 
 /**
@@ -16659,8 +17692,6 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
     
     if(initial) this.is_dirty = false;
     else if(this.jsoneditor.options.show_errors === "change") this.is_dirty = true;
-    
-    if(this.adjust_height) this.adjust_height(this.input);
 
     // Bubble this setValue to parents if the value changed
     this.onChange(changed);
@@ -16787,12 +17818,7 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
     if(typeof this.schema.pattern !== "undefined") this.input.setAttribute('pattern',this.schema.pattern);
     else if(typeof this.schema.minLength !== "undefined") this.input.setAttribute('pattern','.{'+this.schema.minLength+',}');
 
-    if(this.options.compact) {
-      this.container.className += ' compact';
-    }
-    else {
-      if(this.options.input_width) this.input.style.width = this.options.input_width;
-    }
+    if(this.options.compact) this.container.setAttribute('class',this.container.getAttribute('class')+' compact');
 
     if(this.schema.readOnly || this.schema.readonly || this.schema.template) {
       this.always_disabled = true;
@@ -16823,42 +17849,6 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
         self.refreshValue();
         self.onChange(true);
       });
-      
-    if(this.options.input_height) this.input.style.height = this.options.input_height;
-    if(this.options.expand_height) {
-      this.adjust_height = function(el) {
-        if(!el) return;
-        var i, ch=el.offsetHeight;
-        // Input too short
-        if(el.offsetHeight < el.scrollHeight) {
-          i=0;
-          while(el.offsetHeight < el.scrollHeight+3) {
-            if(i>100) break;
-            i++;
-            ch++;
-            el.style.height = ch+'px';
-          }
-        }
-        else {
-          i=0;
-          while(el.offsetHeight >= el.scrollHeight+3) {
-            if(i>100) break;
-            i++;
-            ch--;
-            el.style.height = ch+'px';
-          }
-          el.style.height = (ch+1)+'px';
-        }
-      };
-      
-      this.input.addEventListener('keyup',function(e) {
-        self.adjust_height(this);
-      });
-      this.input.addEventListener('change',function(e) {
-        self.adjust_height(this);
-      });
-      this.adjust_height();
-    }
 
     if(this.format) this.input.setAttribute('data-schemaformat',this.format);
 
@@ -16871,7 +17861,6 @@ JSONEditor.defaults.editors.string = JSONEditor.AbstractEditor.extend({
       // otherwise, in the case of an ace_editor creation,
       // it will generate an error trying to append it to the missing parentNode
       if(self.input.parentNode) self.afterInputReady();
-      if(self.adjust_height) self.adjust_height(self.input);
     });
 
     // Compile and store the template
@@ -17156,7 +18145,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         var editor = self.editors[key];
         if(editor.property_removed) return;
         var found = false;
-        var width = editor.options.hidden? 0 : (editor.options.grid_columns || editor.getNumColumns());
+        var width = editor.options.hidden? 0 : editor.getNumColumns();
         var height = editor.options.hidden? 0 : editor.container.offsetHeight;
         // See if the editor will fit in any of the existing rows first
         for(var i=0; i<rows.length; i++) {
@@ -17297,7 +18286,7 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         });
         self.editors[key].preBuild();
 
-        var width = self.editors[key].options.hidden? 0 : (self.editors[key].options.grid_columns || self.editors[key].getNumColumns());
+        var width = self.editors[key].options.hidden? 0 : self.editors[key].getNumColumns();
 
         self.minwidth += width;
         self.maxwidth += width;
@@ -17320,8 +18309,8 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         self.addObjectProperty(key, true);
 
         if(self.editors[key]) {
-          self.minwidth = Math.max(self.minwidth,(self.editors[key].options.grid_columns || self.editors[key].getNumColumns()));
-          self.maxwidth += (self.editors[key].options.grid_columns || self.editors[key].getNumColumns());
+          self.minwidth = Math.max(self.minwidth,self.editors[key].getNumColumns());
+          self.maxwidth += self.editors[key].getNumColumns();
         }
       });
     }
@@ -17353,9 +18342,6 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
 
         if(self.editors[key].options.hidden) {
           holder.style.display = 'none';
-        }
-        if(self.editors[key].options.input_width) {
-          holder.style.width = self.editors[key].options.input_width;
         }
       });
     }
@@ -17872,9 +18858,9 @@ JSONEditor.defaults.editors.object = JSONEditor.AbstractEditor.extend({
         editor.setValue(value[i],initial);
       }
       // Otherwise, remove value unless this is the initial set or it's required
-      else if(!initial && !self.isRequired(editor)) {
-        self.removeObjectProperty(i);
-      }
+      // else if(!initial && !self.isRequired(editor)) {
+      //  self.removeObjectProperty(i);
+      //}
       // Otherwise, set the value to the default
       else {
         editor.setValue(editor.getDefault(),initial);
@@ -18280,7 +19266,6 @@ JSONEditor.defaults.editors.array = JSONEditor.AbstractEditor.extend({
     self.active_tab = new_active_tab;
 
     self.refreshValue(initial);
-    self.refreshTabs(true);
     self.refreshTabs();
 
     self.onChange();
@@ -18710,13 +19695,11 @@ JSONEditor.defaults.editors.table = JSONEditor.defaults.editors.array.extend({
     this.panel.appendChild(this.controls);
 
     if(this.item_has_child_editors) {
-      var ce = tmp.getChildEditors();
-      var order = tmp.property_order || Object.keys(ce);
-      for(var i=0; i<order.length; i++) {
-        var th = self.theme.getTableHeaderCell(ce[order[i]].getTitle());
-        if(ce[order[i]].options.hidden) th.style.display = 'none';
+      $each(tmp.getChildEditors(), function(i,editor) {
+        var th = self.theme.getTableHeaderCell(editor.getTitle());
+        if(editor.options.hidden) th.style.display = 'none';
         self.header_row.appendChild(th);
-      }
+      });
     }
     else {
       self.header_row.appendChild(self.theme.getTableHeaderCell(this.item_title));
@@ -19586,7 +20569,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
     }
     // Boolean
     else if(this.schema.type === "boolean") {
-      self.enum_display = this.schema.options && this.schema.options.enum_titles || ['true','false'];
+      self.enum_display = ['true','false'];
       self.enum_options = ['1',''];
       self.enum_values = [true,false];
     }
@@ -19657,7 +20640,7 @@ JSONEditor.defaults.editors.select = JSONEditor.AbstractEditor.extend({
     if(!this.options.compact) this.header = this.label = this.theme.getFormInputLabel(this.getTitle());
     if(this.schema.description) this.description = this.theme.getFormInputDescription(this.schema.description);
 
-    if(this.options.compact) this.container.className += ' compact';
+    if(this.options.compact) this.container.setAttribute('class',this.container.getAttribute('class')+' compact');
 
     this.input = this.theme.getSelectInput(this.enum_options);
     this.theme.setSelectOptions(this.input,this.enum_options,this.enum_display);
@@ -21933,11 +22916,9 @@ JSONEditor.defaults.resolvers.unshift(function(schema) {
   }
 })();
 
-  window.JSONEditor = JSONEditor;
+  module.exports = JSONEditor;
 })();
 
-},{}],"json-editor":[function(require,module,exports){
-module.exports=require('pRDjjY');
 },{}],"3pLyGF":[function(require,module,exports){
 /*!
  * mustache.js - Logic-less {{mustache}} templates with JavaScript
@@ -23945,9 +24926,9 @@ module.exports=require('gXiLoN');
 var Loader = function() {
 
   // will be replaced with the json.
-  this.dependencies = {"npm":{"mustache":"latest","domify":"0.x.x","json-editor":"latest","underscore":"1.x.x","dot-object":"0.x.x"}};
+  this.dependencies = {"npm":{"mustache":"latest","domify":"0.x.x","json-editor":"psichi/json-editor","underscore":"1.x.x","dot-object":"0.x.x"}};
   //this.nodes = ;
-  this.nodeDefinitions = {"./graphs/{ns}/{name}.fbp":{"models":{"model":{"id":"MyModel","type":"flow","nodes":[{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","title":"Commands","ns":"object","name":"keys"},{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","title":"CommandsPicker","ns":"data","name":"pick"},{"id":"fb7799df-0093-421b-97c0-88cb6e18047f","title":"ProtocolSchemas","ns":"object","name":"create","context":{"in":{"network":{"title":"Network protocol","description":"Protocol for starting and stopping FBP networks, and finding out about their state.","output":{"stopped":{"title":"Stopped","description":"Inform that a given network has stopped.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was stopped"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"time the network was running, in seconds"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"started":{"title":"Started","description":"Inform that a given network has been started.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was started"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"status":{"title":"Status","description":"Response to a getstatus message.","type":"object","properties":{"running":{"title":"Running","type":"boolean","description":"boolean tells whether the network is running or not"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"(optional) time the network has been running, in seconds"}}},"output":{"description":"An output message from a running network, roughly similar to STDOUT output of a Unix process, or a line of console.log in JavaScript. Output can also be used for passing images from the runtime to the UI.","properties":{"message":{"type":"string","description":"contents of the output line"},"type":{"type":"string","enum":["message","previewurl"],"description":"(optional) type of output, either message or previewurl"},"url":{"type":"string","format":"uri","description":"(optional) URL for an image generated by the runtime"}}},"error":{"description":"An error from a running network, roughly similar to STDERR output of a Unix process, or a line of console.error in JavaScript.","properties":{"message":{"type":"any","description":"contents of the error message"}}},"icon":{"description":"Icon of a component instance has changed.","properties":{"id":{"type":"string","description":"identifier of the node"},"icon":{"type":"string","description":"new icon for the component instance"},"graph":{"type":"string","description":"graph the action targets"}}},"connect":{"description":"Beginning of transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"begingroup":{"description":"Beginning of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"data":{"description":"Data transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"data":{"type":"any","description":"actual data being transmitted, encoded in a way that can be carried over the protocol transport"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"endgroup":{"description":"Ending of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"description":"graph the action targets","type":"string"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"disconnect":{"description":"End of transmission on an edge.","properties":{"id":{"description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}}},"input":{"error":{"description":"Network error"},"start":{"description":"Start execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"getstatus":{"description":"Get the current status of the runtime. The runtime should respond with a status message.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"stop":{"description":"Stop execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"edges":{"description":"List of edges user has selected for inspection in a user interface or debugger, sent from UI to a runtime.","edges":{"type":"array","description":"list of selected edges, each containing","properties":{"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"},"graph":{"type":"string","description":"graph the action targets"}}}}}}}},"component":{"title":"Component protocol","description":"Protocol for handling the component registry.","output":{"error":{"description":"Component error"},"component":{"title":"Component","description":"Transmit the metadata about a component instance.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"component name in format that can be used in graphs"},"description":{"title":"Description","type":"string","description":"(optional) textual description on what the component does"},"icon":{"title":"Icon","type":"string","description":"(optional): visual icon for the component, matching icon names in [Font Awesome](http://fortawesome.github.io/Font-Awesome/icons/)"},"subgraph":{"title":"Subgraph","type":"boolean","description":"boolean telling whether the component is a subgraph"},"inPorts":{"title":"Input Ports","description":"list of input ports, each containing:","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"values":{"title":"Values","type":"array","description":"(optional) array of the values that the port accepts for enum ports"},"default":{"title":"Default","type":"any","description":"(optional) the default value received by the port"}}},"outPorts":{"description":"list of output ports","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"}}}}},"source":{"description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}},"input":{"error":{"title":"Error","description":"Component error","type":"object"},"list":{"title":"List","description":"Request a list of currently available components. Will be responded with a set of `component` messages.","type":"object"},"getsource":{"title":"Get Source","description":"Request for the source code of a given component. Will be responded with a `source` message.","type":"object","properties":{"name":{"type":"string","description":"Name of the component to get source code for"}}},"source":{"title":"Source code","description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}}},"runtime":{"title":"Runtime protocol","description":"When a client connects to a FBP procotol it may choose to discover the capabilities and other information about the runtime.","input":{"error":{"title":"Error","description":"Runtime error","type":"object"},"getruntime":{"title":"Get runtime","description":"Request the information about the runtime. When receiving this message the runtime should response with a runtime message.","type":"object"},"packet":{"title":"Packet","description":"Runtimes that can be used as remote subgraphs (i.e. ones that have reported supporting the protocol:runtime capability) need to be able to receive and transmit information packets at their exposed ports.\nThese packets can be send from the client to the runtime's input ports, or from runtime's output ports to the client.","type":"object","properties":{"port":{"title":"Port","type":"string","description":"port name for the input or output port"},"event":{"title":"Event","type":"string","enum":["connect","begingroup","data","endgroup","disconnect"],"description":"packet event"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"payload":{"title":"Payload","type":"object","description":"(optional) payload for the packet. Used only with begingroup (for group names) and data packets"}}}},"output":{"error":{"title":"Error","description":"Runtime error","type":"object"},"ports":{"title":"Ports","description":"Message sent by the runtime to signal its available ports. The runtime is responsible for sending the up-to-date list of available ports back to client whenever it changes.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"ID of the currently configured main graph running on the runtime"},"inPorts":{"title":"Input ports","description":"list of input ports","type":"array","items":{"type":"object","properties":{"addressable":{"title":"addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","description":"port datatype, for example boolean","type":"string"},"required":{"title":"Required","description":"boolean telling whether the port needs to be connected for the component to work","type":"boolean"},"description":{"title":"Description","type":"string","description":"textual description of the port"}}}},"outPorts":{"title":"Output ports","description":"list of output ports","type":"array","items":{"type":"object","properties":{"description":{"type":"string","description":"textual description of the port"},"required":{"type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"type":{"description":"port datatype, for example boolean","type":"string"},"id":{"description":"port name","type":"string"},"addressable":{"description":"boolean telling whether the port is an ArrayPort","type":"boolean"}}}}}},"runtime":{"title":"Runtime","description":"Response from the runtime to the getruntime request.","type":"object","properties":{"id":{"title":"ID","type":"string","required":false,"description":"(optional) runtime ID used with Flowhub Registry"},"label":{"title":"Label","description":"(optional) Human-readable description of the runtime","type":"string","required":false},"version":{"title":"Version","description":"version of the runtime protocol that the runtime supports, for example 0.4","type":"string"},"capabilities":{"title":"Capabilities","type":"array","items":{"protocol:network":{"description":"the runtime is able to control and introspect its running networks using the Network protocol"},"protocol:component":{"description":"the runtime is able to list and modify its components using the Component protocol"},"protocol:runtime":{"description":"the runtime is able to expose the ports of its main graph using the Runtime protocol and transmit packet information to/from them"},"component:getsource":{"description":"runtime is able to read and send component source code back to client"},"network:persist":{"description":"runtime is able to *flash* a running graph setup into itself, making it persistent across reboots"},"protocol:graph":{"description":"the runtime is able to modify its graphs using the Graph protocol"},"component:setsource":{"description":"runtime is able to compile and run custom components sent as source code strings"}},"description":"array of capability strings for things the runtime is able to do\nIf the runtime is currently running a graph and it is able to speak the full Runtime protocol, it should follow up with a ports message."},"graph":{"title":"Graph","description":"(optional) ID of the currently configured main graph running on the runtime, if any","type":"string","required":false},"type":{"title":"Type","description":"type of the runtime, for example noflo-nodejs or microflo","type":"string"}}}}},"graph":{"title":"Graph protocol","description":"This protocol is utilized for communicating about graph changes in both directions.","output":{"error":{"description":"Graph error","type":"object"},"addnode":{"description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":"string","description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}}},"input":{"error":{"title":"Error","description":"Graph error","type":"object"},"clear":{"title":"Clear","description":"Initialize an empty graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the graph being created. Used for all subsequent messages related to the graph instance","required":true},"name":{"title":"Name","type":"string","description":"(optional) Human-readable label for the graph"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"main":{"title":"Main","type":"boolean","description":"(optional) Identifies the graph as a main graph of a project that should not be registered as a component\nGraphs registered in this way should also be available for use as subgraphs in other graphs. Therefore a graph registration and later changes to it may cause component messages of the Component protocol to be sent back to the client informing of possible changes in the ports of the subgraph component."}}},"subscribe":{"title":"Subscribe","description":"Subscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to subscribe to","required":true}}},"unsubscribe":{"title":"Unsubscribe","description":"Unsubscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to unsubscribe from","required":true}}},"addnode":{"title":"Add node","description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"title":"Removenode","description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"title":"Rename node","description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"title":"Add edge","description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","description":"graph the action targets"}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"titile":"Graph","type":"string","description":"graph the action targets"},"src":{"titile":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"Rename inport","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}}}}}}},{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","title":"Log","ns":"console","name":"log"},{"id":"29b2b735-6c09-46f0-b5ce-50fe50780d16","title":"CommandKey","ns":"object","name":"keys"},{"id":"4508d067-b1b5-486e-b40f-5d7697bdcf59","title":"GetCommands","ns":"object","name":"keys"},{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","title":"BuildPath","ns":"string","name":"append","context":{"append":".input"}},{"id":"51c477d0-5ef7-4961-8e86-688ed2d00087","title":"PrepareCommand","ns":"array","name":"map","context":{"fn":"\n return {\n   label: val,\n   value: val\n }\n"}},{"id":"977581af-7a9c-4775-9f18-20029698c1d8","title":"PickSchema","ns":"data","name":"pick"}],"links":[{"id":"a2d30485-a7ad-4b4f-a5e1-c6e439e6f23c","source":{"id":"4508d067-b1b5-486e-b40f-5d7697bdcf59","port":"out","setting":{"index":0}},"target":{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","port":"in"},"metadata":{"title":"GetCommands out -> in BuildPath"}},{"id":"a7caa285-adda-4c25-90fb-5afbfa486df6","source":{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","port":"out"},"target":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"path"},"metadata":{"title":"BuildPath out -> path CommandsPicker"}},{"id":"c51bb694-5e34-4795-9621-efa017b14497","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"c0e7447e-114d-48af-8c7e-e021055ab078","source":{"id":"2fddaf8f-f285-45a1-9dc3-890577988e87","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"BuildPath out -> msg Log"}},{"id":"dc0beeba-3aea-46c5-a85b-0962db74a557","source":{"id":"fb7799df-0093-421b-97c0-88cb6e18047f","port":"out"},"target":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"in","setting":{"persist":true}},"metadata":{"title":"ProtocolSchemas out -> in CommandsPicker"}},{"id":"c2efd600-42c8-4121-824f-acf5194735dc","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","port":"in"},"metadata":{"title":"CommandsPicker out -> in Commands"}},{"id":"4e22181b-62a0-46da-930c-9cccb0e4cc76","source":{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"Commands out -> msg Log"}},{"id":"84a42273-d0f0-434d-aafc-d11ba7ff5bbe","source":{"id":"98d4db26-c763-4287-b28d-725e4f43b2cb","port":"out"},"target":{"id":"51c477d0-5ef7-4961-8e86-688ed2d00087","port":"in"},"metadata":{"title":"Commands out -> in PrepareCommand"}},{"id":"9350f023-283f-4991-8963-038d76ed8aba","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"e41d7d03-ef37-4d41-8aa9-b210ce354b5b","source":{"id":"82d1b771-13ab-4ea9-b0aa-28017151ce40","port":"out"},"target":{"id":"977581af-7a9c-4775-9f18-20029698c1d8","port":"in","setting":{"persist":true}},"metadata":{"title":"CommandsPicker out -> in PickSchema"}},{"id":"5766d78b-96c3-469e-83f4-aafa5e262cbc","source":{"id":"29b2b735-6c09-46f0-b5ce-50fe50780d16","port":"out","setting":{"index":0}},"target":{"id":"977581af-7a9c-4775-9f18-20029698c1d8","port":"path"},"metadata":{"title":"CommandKey out -> path PickSchema"}},{"id":"52d41b3b-e1a8-4437-8eb5-36c5cc871b69","source":{"id":"29b2b735-6c09-46f0-b5ce-50fe50780d16","port":"out"},"target":{"id":"ceca8ac6-bba3-438f-951c-89b08854a91f","port":"msg"},"metadata":{"title":"CommandKey out -> msg Log"}}],"title":"Modelling","ns":"models","name":"model","ports":{"input":{"command":{"nodeId":"29b2b735-6c09-46f0-b5ce-50fe50780d16","title":"Command","name":"in"},"in":{"nodeId":"4508d067-b1b5-486e-b40f-5d7697bdcf59","title":"In","name":"in"}},"output":{"schema":{"nodeId":"977581af-7a9c-4775-9f18-20029698c1d8","title":"Schema","name":"out"},"options":{"nodeId":"51c477d0-5ef7-4961-8e86-688ed2d00087","title":"Options","name":"out"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graphs/{ns}/{name}.fbp"}}},"./graphs/{name}.fbp":{"protocol":{"message":{"id":"MessageBox","type":"flow","nodes":[{"id":"7d5d06ba-a7c4-400d-b498-f1718681b722","title":"MessageEl","ns":"dom","name":"querySelector","context":{"selector":"#messages"}},{"id":"27099ae3-38ed-4b14-a713-9ba6da88c82b","title":"View","ns":"template","name":"mustache","context":{"body":"<div class=\"message panel panel-info\">\n  <div class=\"panel-heading\">\n    <h3 class=\"panel-title\">{{title}}<button type=\"button\" class=\"close pull-right\" aria-label=\"Close\"><span aria-hidden=\"true\">&times;</span></button></h3>\n  </div>\n  <div class=\"panel-body\">\n     {{body}}\n  </div>\n</div>\n"}},{"id":"a1180477-f906-43b0-90d4-d1934d80f0da","title":"Button","ns":"bootstrap","name":"button"},{"id":"b313bd79-bd62-4169-9b4a-427558998bd6","title":"Click","ns":"dom","name":"addMouseEvent","context":{"event":"click"}},{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","title":"AddMessage","ns":"dom","name":"appendChild"},{"id":"34af3ec0-c377-4931-9cbe-7266be031f25","title":"ToHtml","ns":"dom","name":"domify"},{"id":"7ee06e9c-2f18-40d5-8c02-5b5fef25197e","title":"Log","ns":"console","name":"log"},{"id":"9b96e5ec-f49d-43b4-897c-c8de6c15468f","title":"d","ns":"utils","name":"dummy"}],"links":[{"id":"9ee00908-66e9-43fb-8271-687e70c3ccab","source":{"id":"7d5d06ba-a7c4-400d-b498-f1718681b722","port":"selection"},"target":{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","port":"element","setting":{"persist":true}},"metadata":{"title":"MessageEl selection -> element AddMessage"}},{"id":"e1291f42-c0f9-4ce3-9753-a27132f3ab62","source":{"id":"34af3ec0-c377-4931-9cbe-7266be031f25","port":"out"},"target":{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","port":"child"},"metadata":{"title":"ToHtml out -> child AddMessage"}},{"id":"fe4c31ea-adf1-45cd-bdf1-dbeaa642cf32","source":{"id":"55510383-8f6f-4eb6-a32f-56542ed82482","port":"element"},"target":{"id":"b313bd79-bd62-4169-9b4a-427558998bd6","port":"element"},"metadata":{"title":"AddMessage element -> element Click"}},{"id":"08aa4c24-ca24-4adb-b35d-553c74ca868c","source":{"id":"7d5d06ba-a7c4-400d-b498-f1718681b722","port":"selection"},"target":{"id":"7ee06e9c-2f18-40d5-8c02-5b5fef25197e","port":"msg"},"metadata":{"title":"MessageEl selection -> msg Log"}},{"id":"8250aba7-a91d-4629-baf0-419fbc2734b5","source":{"id":"9b96e5ec-f49d-43b4-897c-c8de6c15468f","port":"out"},"target":{"id":"b313bd79-bd62-4169-9b4a-427558998bd6","port":"in"},"metadata":{"title":"d out -> in Click"}},{"id":"106f8dcd-7371-4ca3-8228-120bfb347259","source":{"id":"27099ae3-38ed-4b14-a713-9ba6da88c82b","port":"out"},"target":{"id":"34af3ec0-c377-4931-9cbe-7266be031f25","port":"in"},"metadata":{"title":"View out -> in ToHtml"}}],"title":"Message Box","ns":"protocol","name":"message","ports":{"input":{"in":{"nodeId":"9b96e5ec-f49d-43b4-897c-c8de6c15468f","title":"In","name":"in"},"vars":{"nodeId":"27099ae3-38ed-4b14-a713-9ba6da88c82b","title":"Vars","name":"vars"}},"output":{"out":{"nodeId":"b313bd79-bd62-4169-9b4a-427558998bd6","title":"Out","name":"out"},"event":{"nodeId":"b313bd79-bd62-4169-9b4a-427558998bd6","title":"Event","name":"event"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graphs/{name}.fbp"}}},"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"dom":{"querySelector":{"_id":"527299bb30b8af4b8910216b","name":"querySelector","ns":"dom","title":"querySelector","description":"[Document query selector](https://developer.mozilla.org/en-US/docs/Web/API/document.querySelector)","expose":["document"],"phrases":{"active":"Gathering elements matching criteria: {{input.selector}}"},"ports":{"input":{"element":{"title":"Element","type":"HTMLElement","default":null},"selector":{"title":"Selector","type":"string"}},"output":{"element":{"title":"Element","type":"HTMLElement"},"selection":{"title":"Selection","type":"HTMLElement"},"error":{"title":"Error","type":"Error"}}},"fn":"var el = input.element ? input.element : document;\noutput = {\n  element: el\n};\n\nvar selection = el.querySelector(input.selector);\nif(selection) {\n  output.selection = selection;\n} else {\n  output.error = Error('Selector ' + input.selector + ' did not match');\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"setHtml":{"_id":"52be32d46a14bb6fbd924a24","name":"setHtml","ns":"dom","description":"dom setHtml","async":true,"phrases":{"active":"Adding html"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"html":{"type":"string","format":"html","title":"html","async":true}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"}}},"fn":"on.input.html = function(data) {\n  input.element.innerHTML = data;\n  output({ element: input.element });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"addMouseEvent":{"_id":"52be4f096a14bb6fbd924a28","name":"addMouseEvent","ns":"dom","description":"Add Mouse Event Listener","async":true,"phrases":{"active":"Adding {{input.event}} handler"},"ports":{"input":{"in":{"title":"Input","type":"any","async":true,"default":null},"element":{"type":"HTMLElement","title":"Dom Element","async":true},"preventDefault":{"type":"boolean","title":"Prevent Default Event","default":true},"event":{"type":"string","enum":["click","dblclick","mousedown","mouseup","mouseover","mousemove","mouseout","dragstart","drag","dragenter","dragleave","dragover","drop","dragend"],"title":"Dom Event"}},"output":{"element":{"type":"any","title":"Element"},"out":{"type":"any","title":"Output"},"event":{"type":"object","title":"Event"}}},"fn":"state.in = null;\nstate.event = null;\nstate.preventDefault = null;\n\nstate.clickHandler = function(ev) {\n  if(state.preventDefault) ev.preventDefault();\n  output({\n    out: state.in,\n    event: ev\n  });\n};\n\non.input.in = function() {\n  state.in = data;\n};\n\non.input.element = function() {\n\n  if (!state.in) return false;\n\n  if(state.el) {\n    state.el.removeEventListener(state.event);\n  }\n  state.el = input.element;\n  state.event = input.event;\n  state.preventDefault = input.preventDefault;\n\n  state.el.addEventListener(input.event, state.clickHandler, false);\n  output({element: input.element});\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"appendChild":{"_id":"52be32d46a14bb6fbd924a20","name":"appendChild","ns":"dom","description":"dom appendChild","async":true,"phrases":{"active":"Adding child node"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"child":{"type":"HTMLElement","async":true,"title":"Child Element"}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"},"out":{"type":"object"}}},"fn":"on.input.child = function() {\n\n  output( {\n    element: input.element,\n    out: input.element.appendChild(data)\n  } );\n\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"domify":{"_id":"530556db041b29b9e16b1d1f","name":"domify","ns":"dom","title":"Domify","description":"Turn HTML into DOM elements x-browser","phrases":{"active":"Domifying HTML"},"ports":{"input":{"in":{"title":"Html","type":"string","format":"html","required":"true"}},"output":{"out":{"title":"Dom Elements","type":["HTMLElement","DocumentFragment"]}}},"dependencies":{"npm":{"domify":"0.x.x"}},"fn":"output.out = domify(input.in);\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"bootstrap":{"select":{"_id":"54b74927fa15e75e679fd19c","name":"select","ns":"bootstrap","title":"Select","description":"Bootstrap - select","async":true,"dependencies":{"npm":{"mustache":"latest","domify":"latest"}},"ports":{"input":{"element":{"type":"HTMLElement","title":"Parent Element","async":true},"template":{"title":"Template","type":"string","default":"<div>{{#label}}<label>{{label}}</label>{{/label}}<select id=\"{{id}}\" class=\"form-control\">{{#options}}<option value=\"{{value}}\">{{label}}</option>{{/options}}</select></div>","format":"html"},"id":{"type":"string","title":"ID","default":""},"label":{"type":"string","title":"Label","default":""},"options":{"title":"Variables","type":"array","items":{"type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"},"additionalProperties":false}}}},"output":{"element":{"title":"Element","type":"HTMLFragment"},"out":{"title":"Value","type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"}}}}},"fn":"state.select = null;\nstate.view = {};\nstate.changed = function () {\n\n  var out = {};\n  var self = this;\n\n  out[this.value] = state.view.options.filter(function(opt) {\n    return opt.value === self.value;\n  }).pop();\n\n  output({out: out});\n};\n\non.input.element = function () {\n\n  if (state.select) {\n    state.select.removeEventListener('change', state.changed);\n    input.element.innerHTML = null;\n  }\n\n  state.view = {\n    id: input.id,\n    label: input.label,\n    options: input.options\n  };\n\n  var el = domify(mustache.render(input.template, state.view));\n\n  input.element.appendChild(el);\n\n  state.select = input.element.querySelector('select');\n  state.select.addEventListener('change', state.changed);\n\n  output({\n    element: input.element\n  });\n\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"button":{"_id":"54bc6765fa15e75e679fd1ac","name":"button","ns":"bootstrap","title":"Button","description":"Bootstrap - button","async":true,"ports":{"input":{"element":{"title":"Parent Element","type":"HTMLElement","async":true},"classList":{"title":"Class list","type":"string","default":"btn btn-default"},"in":{"type":"any","description":"Input to send to output when clicked","title":"Input","async":true},"label":{"type":"string","title":"Label","default":"Click!"},"attr":{"title":"Attributes","type":"object","default":{}}},"output":{"element":{"title":"Element","type":"HTMLElement"},"error":{"title":"Error","type":"Error"},"event":{"title":"Event","type":"object"},"out":{"title":"Output","type":"any"}}},"fn":"state.el = null;\nstate.clickHandler = function(ev) {\n  output({\n    event: ev,\n    out: state.in\n  });\n};\n\non.input.element = function() {\n  if (state.el) {\n    state.el.removeEventListener('click', state.clickHandler);\n    state.el.innerHTML = null;\n  }\n  state.el = document.createElement('button');\n  state.el.setAttribute('type', 'button');\n  state.el.innerHTML = input.label;\n  state.el.className = input.classList;\n  Object.keys(input.attr).forEach(function(name) {\n    state.el.setAttribute(name, input.attr[name]);\n  });\n  state.el.addEventListener('click', state.clickHandler);\n  input.element.appendChild(state.el);\n  output({\n    element: input.element\n  });\n};\n\non.input.in = function () {\n  state.in = data;\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"json-editor":{"editor":{"_id":"54b36348b314b122580582fa","name":"editor","ns":"json-editor","title":"JSON Editor","description":"JSON Editor","async":true,"phrases":{"active":"Creating JSON Editor"},"dependencies":{"npm":{"json-editor":"latest"}},"ports":{"input":{"element":{"title":"Element","description":"Element","type":"HTMLElement"},"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"schema":{"title":"Schema","type":"object","description":"A valid JSON Schema to use for the editor. Version 3 and Version 4 of the draft specification are supported.","async":true},"enable":{"title":"Enable","description":"Enable","async":true},"disable":{"title":"Disable","description":"Disable","async":true},"options":{"title":"Options","type":"object","properties":{"ajax":{"title":"Ajax","description":"If true, JSON Editor will load external URLs in $ref via ajax.","default":false},"disable_array_add":{"title":"Disable array add","description":"If true, remove all `add row` buttons from arrays.","default":false},"disable_array_delete":{"title":"Disable array delete","description":"If true, remove all `delete row` buttons from arrays.","default":false},"disable_array_reorder":{"title":"Disable array reorder","description":"If true, remove all `move up` and `move down` buttons from arrays.","default":false},"disable_collapse":{"title":"Disable collapse","description":"If true, remove all collapse buttons from objects and arrays.","default":false},"disable_edit_json":{"title":"Disable edit json","description":"If true, remove all Edit JSON buttons from objects.","default":false},"disable_properties":{"title":"Disable properties","description":"If true, remove all Edit Properties buttons from objects.","default":false},"form_name_root":{"title":"Form name root","description":"The first part of the `name` attribute of form inputs in the editor. An full example name is `root[person][name]` where `root` is the form_name_root.","default":"root"},"iconlib":{"title":"Iconlib","description":"The icon library to use for the editor. See the CSS Integration section below for more info.","default":null},"no_additional_properties":{"title":"No additional properties","description":"If true, objects can only contain properties defined with the properties keyword.","default":false},"refs":{"title":"Refs","description":"An object containing schema definitions for URLs. Allows you to pre-define external schemas.","default":{}},"required_by_default":{"title":"Required by default","description":"If true, all schemas that don't explicitly set the required property will be required.","default":false},"show_errors":{"title":"Show errors","description":"When to show validation errors in the UI. Valid values are interaction, change, always, and never.","default":"interaction"},"startval":{"title":"Start value","description":" Seed the editor with an initial value. This should be valid against the editor's schema.","default":null},"template":{"title":"Template","description":"The JS template engine to use. See the Templates and Variables section below for more info.","default":"default"},"theme":{"title":"Theme","description":"The CSS theme to use. See the CSS Integration section below for more info.","default":"html"}}}},"output":{"out":{"title":"out","type":"string"},"editor":{"title":"Editor","type":"JSONEditor"}}},"fn":"state.jsonEditor = null;\nstate.changeHandler = function() {\n    output({out: state.jsonEditor.getValue()});\n};\n\non.input.in = function() {\n  state.in = data;\n  if (state.jsonEditor) {\n    state.jsonEditor.setValue(state.in);\n  }\n};\n\non.input.schema = function() {\n  state.schema = input.options.schema = input.schema;\n  if (state.jsonEditor) {\n    state.jsonEditor.off('change', state.changeHandler);\n    state.jsonEditor.destroy();\n  }\n  state.jsonEditor = new json_editor(input.element, input.options);\n  // problem if state.in is not about this schema..\n  state.jsonEditor.on('ready', function() {\n    if (state.in) {\n      state.jsonEditor.setValue(state.in);\n    }\n    state.jsonEditor.on('change', state.changeHandler);\n    output({editor: state.jsonEditor});\n  });\n};\n\non.input.enable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.enable();\n  }\n};\n\non.input.disable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.disable();\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"validate":{"_id":"54bc6c5cfa15e75e679fd1ad","name":"validate","ns":"json-editor","title":"JSON Editor Validate","description":"JSON Editor Validate","async":true,"phrases":{"active":"Validating form"},"ports":{"input":{"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"editor":{"title":"Editor","type":"function","description":"JSONEditor instance"}},"output":{"out":{"title":"Output","type":"string"},"errors":{"title":"Errors","type":"array","items":{"type":"object","properties":{"path":{"title":"Path","description":"a dot separated path into the JSON object (e.g. `root.path.to.field`)","type":"string"},"property":{"title":"Property","description":"schema keyword that triggered the validation error (e.g. `minLength`)","type":"string"},"message":{"title":"Message","type":"string"}}}}}},"fn":"on.input.in = function() {\n  var errors = input.editor.validate(data);\n  if(errors.length) {\n    output({errors: errors});\n  } else {\n    output({out: data});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"object":{"keys":{"_id":"52ef3630cf8e1bab142d5394","name":"keys","ns":"object","async":true,"description":"Retrieve all the names of the object's properties","phrases":{"active":"Retrieving object properties"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true},"path":{"title":"Path","type":"string","default":null}},"output":{"out":{"title":"out","type":"array"}}},"dependencies":{"npm":{"underscore":"1.x.x","dot-object":"0.x.x"}},"fn":"on.input.in = function() {\n  var val = input.path ? dot_object().pick(input.path, data) : data;\n  output( { out: underscore.keys(val) } );\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"create":{"_id":"52fa908e909495ebbe6ded4c","name":"create","ns":"object","async":true,"description":"Create an object, if input is a direct object it just returns a copy of the object","phrases":{"active":"Creating object"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true}},"output":{"out":{"title":"out","type":"object"}}},"fn":"on.input.in = function(data) { output({out: data}); };\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"data":{"pick":{"_id":"527d857e83f0adcc47800e7c","name":"pick","ns":"data","title":"Pick","async":true,"description":"Pick one value from an object","phrases":{"active":"Picking {{input.path}} from object"},"ports":{"input":{"in":{"title":"Object","description":"An Object, e.g { name: { first: 'John', last: 'Doe' } }","type":"object","async":true},"path":{"title":"Path","description":"Specify a path with . syntax (e.g. name.last )","type":"string","required":true}},"output":{"out":{"title":"Output","type":"any"},"error":{"title":"Error","type":"Error"}}},"dependencies":{"npm":{"dot-object":"0.x.x"}},"fn":"on.input.in = function(data) {\n  // dot_object api should be fixed..\n  var res = dot_object().pick(input.path, data);\n  if(typeof res !== 'undefined') {\n    output({out: res});\n  } else {\n    output({error: Error(input.path + ' not found')});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"string":{"append":{"_id":"52ef363bcf8e1bab142d53b7","name":"append","ns":"string","description":"Appends a string to an other string","phrases":{"active":"Appending string"},"ports":{"input":{"in":{"title":"String","type":"string","required":true},"append":{"title":"Other String","type":"string","required":true}},"output":{"out":{"title":"String","type":"string"}}},"fn":"output.out = input.in + input.append\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"array":{"map":{"_id":"54b8835afa15e75e679fd19d","name":"map","ns":"array","async":true,"description":"Creates new array output with the results of calling the provided function on every element in this array","phrases":{"active":"Mapping array"},"ports":{"input":{"in":{"title":"Value","type":"array","async":true},"fn":{"title":"Function","type":"function","args":["val","index","array"]}},"output":{"out":{"title":"Output","type":"array"}}},"fn":"on.input.in = function() {\n  output({\n    out: data.map(input.fn)\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"template":{"mustache":{"_id":"52645993df5da0102500005e","name":"mustache","ns":"template","description":"Mustache Template engine","phrases":{"active":"Compiling mustache template"},"ports":{"input":{"body":{"type":"string","format":"html","title":"Template body","description":"The body of the mustache template","required":true},"vars":{"type":"object","title":"Input variables","description":"the input variables for this template","required":true,"readonly":true}},"output":{"out":{"title":"String","type":"string"}}},"dependencies":{"npm":{"mustache":"latest"}},"fn":"output = {\n  out: mustache.render(input.body, input.vars)\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"utils":{"dummy":{"_id":"52ef363dcf8e1bab142d53bb","name":"dummy","ns":"utils","title":"Dummy","description":"Takes an input and passes it to output.","phrases":{"active":"Dummy"},"ports":{"input":{"in":{"type":"any","title":"Input"}},"output":{"out":{"type":"any","title":"Output"}}},"fn":"output.out = input. in\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}},"./{ns}/{name}.fbp":{},"./{name}.fbp":{},"{.ns}/{name}.fbp":{},"{name}.fbp":{},"{ns}/{name}.fbp":{}};
+  this.nodeDefinitions = {"./graphs/{ns}/{name}.fbp":{"models":{"model":{"id":"MyModel","type":"flow","nodes":[{"id":"1eab118d-a16f-418a-b559-995ce08661b2","title":"Commands","ns":"object","name":"keys"},{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","title":"CommandsPicker","ns":"data","name":"pick"},{"id":"609c2042-7b9d-48ac-bcd5-7e81138d8ab6","title":"ProtocolSchemas","ns":"object","name":"create","context":{"in":{"network":{"title":"Network protocol","description":"Protocol for starting and stopping FBP networks, and finding out about their state.","output":{"stopped":{"title":"Stopped","description":"Inform that a given network has stopped.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was stopped"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"time the network was running, in seconds"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"started":{"title":"Started","description":"Inform that a given network has been started.","type":"object","properties":{"time":{"title":"Time","type":"string","format":"date-time","description":"time when the network was started"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"status":{"title":"Status","description":"Response to a getstatus message.","type":"object","properties":{"running":{"title":"Running","type":"boolean","description":"boolean tells whether the network is running or not"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"uptime":{"title":"Uptime","type":"string","format":"date-time","description":"(optional) time the network has been running, in seconds"}}},"output":{"description":"An output message from a running network, roughly similar to STDOUT output of a Unix process, or a line of console.log in JavaScript. Output can also be used for passing images from the runtime to the UI.","properties":{"message":{"type":"string","description":"contents of the output line"},"type":{"type":"string","enum":["message","previewurl"],"description":"(optional) type of output, either message or previewurl"},"url":{"type":"string","format":"uri","description":"(optional) URL for an image generated by the runtime"}}},"error":{"description":"An error from a running network, roughly similar to STDERR output of a Unix process, or a line of console.error in JavaScript.","properties":{"message":{"type":"any","description":"contents of the error message"}}},"icon":{"description":"Icon of a component instance has changed.","properties":{"id":{"type":"string","description":"identifier of the node"},"icon":{"type":"string","description":"new icon for the component instance"},"graph":{"type":"string","description":"graph the action targets"}}},"connect":{"description":"Beginning of transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"begingroup":{"description":"Beginning of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"data":{"description":"Data transmission on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"data":{"type":"any","description":"actual data being transmitted, encoded in a way that can be carried over the protocol transport"},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"endgroup":{"description":"Ending of a group (bracket IP) on an edge.","properties":{"id":{"type":"string","description":"textual edge identifier, usually in form of a FBP language line"},"src":{"description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"group":{"description":"group name","type":"string"},"graph":{"description":"graph the action targets","type":"string"},"subgraph":{"type":"array","description":"(optional): subgraph identifier for the event. An array of node IDs"}}},"disconnect":{"description":"End of transmission on an edge.","properties":{"id":{"description":"textual edge identifier, usually in form of a FBP language line"},"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"graph":{"type":"string","description":"graph the action targets"},"subgraph":{"type":"string","description":"(optional): subgraph identifier for the event. An array of node IDs"}}}},"input":{"error":{"description":"Network error"},"start":{"description":"Start execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"getstatus":{"description":"Get the current status of the runtime. The runtime should respond with a status message.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"stop":{"description":"Stop execution of a FBP network based on a given graph.","properties":{"graph":{"type":"string","description":"graph the action targets"}}},"edges":{"description":"List of edges user has selected for inspection in a user interface or debugger, sent from UI to a runtime.","edges":{"type":"array","description":"list of selected edges, each containing","properties":{"src":{"type":"object","description":"source node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"}}},"tgt":{"type":"object","description":"target node for the edge","properties":{"node":{"type":"string","description":"node identifier"},"port":{"type":"string","description":"port name"},"graph":{"type":"string","description":"graph the action targets"}}}}}}}},"component":{"title":"Component protocol","description":"Protocol for handling the component registry.","output":{"error":{"description":"Component error"},"component":{"title":"Component","description":"Transmit the metadata about a component instance.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"component name in format that can be used in graphs"},"description":{"title":"Description","type":"string","description":"(optional) textual description on what the component does"},"icon":{"title":"Icon","type":"string","description":"(optional): visual icon for the component, matching icon names in [Font Awesome](http://fortawesome.github.io/Font-Awesome/icons/)"},"subgraph":{"title":"Subgraph","type":"boolean","description":"boolean telling whether the component is a subgraph"},"inPorts":{"title":"Input Ports","description":"list of input ports, each containing:","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"values":{"title":"Values","type":"array","description":"(optional) array of the values that the port accepts for enum ports"},"default":{"title":"Default","type":"any","description":"(optional) the default value received by the port"}}},"outPorts":{"description":"list of output ports","type":"object","properties":{"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","type":"string","description":"port datatype, for example `boolean`"},"description":{"title":"Description","type":"string","description":"textual description of the port"},"addressable":{"title":"Addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"required":{"title":"Required","type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"}}}}},"source":{"description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}},"input":{"error":{"title":"Error","description":"Component error","type":"object"},"list":{"title":"List","description":"Request a list of currently available components. Will be responded with a set of `component` messages.","type":"object"},"getsource":{"title":"Get Source","description":"Request for the source code of a given component. Will be responded with a `source` message.","type":"object","properties":{"name":{"type":"string","description":"Name of the component to get source code for"}}},"source":{"title":"Source code","description":"Source code for a component. In cases where a runtime receives a `source` message, it should do whatever operations are needed for making that component available for graphs, including possible compilation.","type":"object","properties":{"name":{"title":"Name","type":"string","description":"Name of the component"},"language":{"title":"Language","type":"string","description":"The programming language used for the component code, for example `coffeescript`"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"code":{"title":"Code","type":"string","description":"Component source code"},"tests":{"title":"Tests","type":"string","description":"(optional) unit tests for the component"}}}}},"runtime":{"title":"Runtime protocol","description":"When a client connects to a FBP procotol it may choose to discover the capabilities and other information about the runtime.","input":{"error":{"title":"Error","description":"Runtime error","type":"object"},"getruntime":{"title":"Get runtime","description":"Request the information about the runtime. When receiving this message the runtime should response with a runtime message.","type":"object"},"packet":{"title":"Packet","description":"Runtimes that can be used as remote subgraphs (i.e. ones that have reported supporting the protocol:runtime capability) need to be able to receive and transmit information packets at their exposed ports.\nThese packets can be send from the client to the runtime's input ports, or from runtime's output ports to the client.","type":"object","properties":{"port":{"title":"Port","type":"string","description":"port name for the input or output port"},"event":{"title":"Event","type":"string","enum":["connect","begingroup","data","endgroup","disconnect"],"description":"packet event"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"payload":{"title":"Payload","type":"object","description":"(optional) payload for the packet. Used only with begingroup (for group names) and data packets"}}}},"output":{"error":{"title":"Error","description":"Runtime error","type":"object"},"ports":{"title":"Ports","description":"Message sent by the runtime to signal its available ports. The runtime is responsible for sending the up-to-date list of available ports back to client whenever it changes.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"ID of the currently configured main graph running on the runtime"},"inPorts":{"title":"Input ports","description":"list of input ports","type":"array","items":{"type":"object","properties":{"addressable":{"title":"addressable","type":"boolean","description":"boolean telling whether the port is an ArrayPort"},"id":{"title":"ID","type":"string","description":"port name"},"type":{"title":"Type","description":"port datatype, for example boolean","type":"string"},"required":{"title":"Required","description":"boolean telling whether the port needs to be connected for the component to work","type":"boolean"},"description":{"title":"Description","type":"string","description":"textual description of the port"}}}},"outPorts":{"title":"Output ports","description":"list of output ports","type":"array","items":{"type":"object","properties":{"description":{"type":"string","description":"textual description of the port"},"required":{"type":"boolean","description":"boolean telling whether the port needs to be connected for the component to work"},"type":{"description":"port datatype, for example boolean","type":"string"},"id":{"description":"port name","type":"string"},"addressable":{"description":"boolean telling whether the port is an ArrayPort","type":"boolean"}}}}}},"runtime":{"title":"Runtime","description":"Response from the runtime to the getruntime request.","type":"object","properties":{"id":{"title":"ID","type":"string","required":false,"description":"(optional) runtime ID used with Flowhub Registry"},"label":{"title":"Label","description":"(optional) Human-readable description of the runtime","type":"string","required":false},"version":{"title":"Version","description":"version of the runtime protocol that the runtime supports, for example 0.4","type":"string"},"capabilities":{"title":"Capabilities","type":"array","items":{"protocol:network":{"description":"the runtime is able to control and introspect its running networks using the Network protocol"},"protocol:component":{"description":"the runtime is able to list and modify its components using the Component protocol"},"protocol:runtime":{"description":"the runtime is able to expose the ports of its main graph using the Runtime protocol and transmit packet information to/from them"},"component:getsource":{"description":"runtime is able to read and send component source code back to client"},"network:persist":{"description":"runtime is able to *flash* a running graph setup into itself, making it persistent across reboots"},"protocol:graph":{"description":"the runtime is able to modify its graphs using the Graph protocol"},"component:setsource":{"description":"runtime is able to compile and run custom components sent as source code strings"}},"description":"array of capability strings for things the runtime is able to do\nIf the runtime is currently running a graph and it is able to speak the full Runtime protocol, it should follow up with a ports message."},"graph":{"title":"Graph","description":"(optional) ID of the currently configured main graph running on the runtime, if any","type":"string","required":false},"type":{"title":"Type","description":"type of the runtime, for example noflo-nodejs or microflo","type":"string"}}}}},"graph":{"title":"Graph protocol","description":"This protocol is utilized for communicating about graph changes in both directions.","output":{"error":{"description":"Graph error","type":"object"},"addnode":{"description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier","required":true},"port":{"title":"Port","type":"string","description":"port name","required":true},"index":{"title":"Index","type":"string","description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"src":{"title":"Source","type":"object","description":"source node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","required":true,"properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}}},"input":{"error":{"title":"Error","description":"Graph error","type":"object"},"clear":{"title":"Clear","description":"Initialize an empty graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the graph being created. Used for all subsequent messages related to the graph instance","required":true},"name":{"title":"Name","type":"string","description":"(optional) Human-readable label for the graph"},"library":{"title":"Library","type":"string","description":"(optional) Component library identifier"},"main":{"title":"Main","type":"boolean","description":"(optional) Identifies the graph as a main graph of a project that should not be registered as a component\nGraphs registered in this way should also be available for use as subgraphs in other graphs. Therefore a graph registration and later changes to it may cause component messages of the Component protocol to be sent back to the client informing of possible changes in the ports of the subgraph component."}}},"subscribe":{"title":"Subscribe","description":"Subscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to subscribe to","required":true}}},"unsubscribe":{"title":"Unsubscribe","description":"Unsubscribe to a graph.","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph to unsubscribe from","required":true}}},"addnode":{"title":"Add node","description":"Add node to a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"component":{"title":"Component","type":"string","description":"component name used for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"removenode":{"title":"Removenode","description":"Remove a node from a graph.","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"renamenode":{"title":"Rename node","description":"Change the ID of a node in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original identifier for the node","required":true},"to":{"title":"To","type":"string","description":"new identifier for the node","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"changenode":{"title":"Change node","description":"Change the metadata associated to a node in the graph","type":"object","properties":{"id":{"title":"ID","type":"string","description":"identifier for the node","required":true},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for node metadata","required":true},"graph":{"title":"Graph","type":"string","description":"graph the action targets","required":true}}},"addedge":{"title":"Add edge","description":"Add an edge to the graph","type":"object","properties":{"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"graph":{"title":"Graph","description":"graph the action targets"}}},"removeedge":{"title":"Remove edge","description":"Remove an edge from the graph","type":"object","properties":{"graph":{"titile":"Graph","type":"string","description":"graph the action targets"},"src":{"titile":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"changeedge":{"title":"Change edge","description":"Change an edge's metadata","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"struct of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","description":"source node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}}}}},"addinitial":{"title":"Add initial","description":"Add an IIP to the graph","type":"object","properties":{"graph":{"title":"Graph","type":"string","description":"graph the action targets"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for edge metadata"},"src":{"title":"Source","type":"object","properties":{"data":{"title":"Data","type":"any","description":"IIP value in its actual data type"}}},"tgt":{"title":"Target","type":"object","description":"target node for the edge","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"},"index":{"title":"Index","type":["string","number"],"description":"connection index (optional, for addressable ports)"}}}}},"removeinitial":{"title":"Remove initial","description":"Remove an IIP from the graph","type":"object","properties":{"tgt":{"title":"Target","type":"object","properties":{"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"port name"}},"description":"target node for the edge"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addinport":{"title":"Add inport","description":"Add an exported inport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for node metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeinport":{"title":"Remove inport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameinport":{"title":"Rename inport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"Rename inport","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addoutport":{"title":"Add outport","description":"Add an exported outport to the graph.","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port"},"node":{"title":"Node","type":"string","description":"node identifier"},"port":{"title":"Port","type":"string","description":"internal port name"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for port metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"removeoutport":{"title":"Remove outport","description":"Remove an exported port from the graph","type":"object","properties":{"public":{"title":"Public","type":"string","description":"the exported name of the port to remove"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renameoutport":{"title":"Rename outport","description":"Rename an exported port in the graph","type":"object","properties":{"from":{"title":"From","type":"string","description":"original exported port name"},"to":{"title":"To","type":"string","description":"new exported port name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"addgroup":{"title":"Add group","description":"Add a group to the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"nodes":{"title":"Nodes","type":"array","description":"an array of node ids part of the group"},"metadata":{"title":"Metadata","type":"object","description":"(optional): structure of key-value pairs for group metadata"},"graph":{"type":"string","description":"graph the action targets"}}},"removegroup":{"title":"Remove group","description":"Remove a group from the graph","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"renamegroup":{"title":"Rename group","description":"Rename a group in the graph.","type":"object","properties":{"from":{"title":"From","type":"string","description":"original group name"},"to":{"title":"To","type":"string","description":"new group name"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}},"changegroup":{"title":"Change group","description":"Change a group's metadata","type":"object","properties":{"name":{"title":"Name","type":"string","description":"the group name"},"metadata":{"title":"Metadata","type":"object","description":"structure of key-value pairs for group metadata"},"graph":{"title":"Graph","type":"string","description":"graph the action targets"}}}}}}}},{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","title":"Log","ns":"console","name":"log"},{"id":"1c055b93-da6f-4355-8969-453f4c9aaa12","title":"CommandKey","ns":"object","name":"keys"},{"id":"d8846fbe-e4b8-4b1e-9783-04dd8efc504c","title":"GetCommands","ns":"object","name":"keys"},{"id":"cc238c96-9745-489a-849c-1f4829e65747","title":"BuildPath","ns":"string","name":"append","context":{"append":".input"}},{"id":"1092c08a-8c34-48ab-b638-28473005b5cb","title":"PrepareCommand","ns":"array","name":"map","context":{"fn":"\n return {\n   label: val,\n   value: val\n }\n"}},{"id":"a35d78f2-9115-4286-8bf9-8b52bf866c9c","title":"PickSchema","ns":"data","name":"pick"}],"links":[{"id":"68fb67c0-ba2a-43fe-b93d-b977871c1285","source":{"id":"d8846fbe-e4b8-4b1e-9783-04dd8efc504c","port":"out","setting":{"index":0}},"target":{"id":"cc238c96-9745-489a-849c-1f4829e65747","port":"in"},"metadata":{"title":"GetCommands out -> in BuildPath"}},{"id":"49b066f1-fc0d-4ef4-b13d-740bf2f1e04b","source":{"id":"cc238c96-9745-489a-849c-1f4829e65747","port":"out"},"target":{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","port":"path"},"metadata":{"title":"BuildPath out -> path CommandsPicker"}},{"id":"d65023e9-b935-4cdf-81d4-82f612f5f803","source":{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","port":"out"},"target":{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"9f726fd4-c9c3-42a7-bdea-2c5af6002293","source":{"id":"cc238c96-9745-489a-849c-1f4829e65747","port":"out"},"target":{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","port":"msg"},"metadata":{"title":"BuildPath out -> msg Log"}},{"id":"29b9c018-1257-4662-bcb2-b27ff2f0eb8a","source":{"id":"609c2042-7b9d-48ac-bcd5-7e81138d8ab6","port":"out"},"target":{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","port":"in","setting":{"persist":true}},"metadata":{"title":"ProtocolSchemas out -> in CommandsPicker"}},{"id":"d89be0fd-6603-4834-9ca8-08d4430f1c8e","source":{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","port":"out"},"target":{"id":"1eab118d-a16f-418a-b559-995ce08661b2","port":"in"},"metadata":{"title":"CommandsPicker out -> in Commands"}},{"id":"6f2b1148-d225-4905-a851-62d966bab78a","source":{"id":"1eab118d-a16f-418a-b559-995ce08661b2","port":"out"},"target":{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","port":"msg"},"metadata":{"title":"Commands out -> msg Log"}},{"id":"f6093a34-6d79-4889-b1c9-1b0835d3c065","source":{"id":"1eab118d-a16f-418a-b559-995ce08661b2","port":"out"},"target":{"id":"1092c08a-8c34-48ab-b638-28473005b5cb","port":"in"},"metadata":{"title":"Commands out -> in PrepareCommand"}},{"id":"0b18a0c3-970b-4157-add6-dfadafc9a870","source":{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","port":"out"},"target":{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","port":"msg"},"metadata":{"title":"CommandsPicker out -> msg Log"}},{"id":"c5506037-ccca-40c3-bf92-e159f769ea85","source":{"id":"c47086e4-d7b0-4ccf-a7d1-fc8b0860cd2a","port":"out"},"target":{"id":"a35d78f2-9115-4286-8bf9-8b52bf866c9c","port":"in","setting":{"persist":true}},"metadata":{"title":"CommandsPicker out -> in PickSchema"}},{"id":"49faf9dd-1121-469b-af82-f0701d7d6edc","source":{"id":"1c055b93-da6f-4355-8969-453f4c9aaa12","port":"out","setting":{"index":0}},"target":{"id":"a35d78f2-9115-4286-8bf9-8b52bf866c9c","port":"path"},"metadata":{"title":"CommandKey out -> path PickSchema"}},{"id":"e17c8d9b-9b8d-4d13-934b-d74fa9bbb995","source":{"id":"1c055b93-da6f-4355-8969-453f4c9aaa12","port":"out"},"target":{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","port":"msg"},"metadata":{"title":"CommandKey out -> msg Log"}},{"id":"7173a8a5-4994-40d8-92cd-7e22dde81637","source":{"id":"a35d78f2-9115-4286-8bf9-8b52bf866c9c","port":"error"},"target":{"id":"a87dd71f-48c0-4d33-9542-5e3ad9a2116f","port":"msg"},"metadata":{"title":"PickSchema error -> msg Log"}}],"title":"Modelling","ns":"models","name":"model","ports":{"input":{"command":{"nodeId":"1c055b93-da6f-4355-8969-453f4c9aaa12","title":"Command","name":"in"},"in":{"nodeId":"d8846fbe-e4b8-4b1e-9783-04dd8efc504c","title":"In","name":"in"}},"output":{"schema":{"nodeId":"a35d78f2-9115-4286-8bf9-8b52bf866c9c","title":"Schema","name":"out"},"options":{"nodeId":"1092c08a-8c34-48ab-b638-28473005b5cb","title":"Options","name":"out"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graphs/{ns}/{name}.fbp"}}},"./graphs/{name}.fbp":{"protocol":{"message":{"id":"MessageBox","type":"flow","nodes":[{"id":"d23bb485-af77-4344-8586-842dbba6a979","title":"MessageEl","ns":"dom","name":"querySelector","context":{"selector":"#messages"}},{"id":"6636c6c1-6d12-4a18-8d74-0364ebd98fc3","title":"View","ns":"template","name":"mustache","context":{"body":"<div class=\"message panel panel-info\">\n  <div class=\"panel-heading\">\n    <h3 class=\"panel-title\">{{title}}<button type=\"button\" class=\"close pull-right\" aria-label=\"Close\"><span aria-hidden=\"true\">&times;</span></button></h3>\n  </div>\n  <div class=\"panel-body\">\n     {{body}}\n  </div>\n</div>\n"}},{"id":"b26425df-7a19-4349-bd69-1f51fd5506db","title":"Button","ns":"bootstrap","name":"button"},{"id":"def9bef6-b6e3-4e00-9ef0-3c2c7da14180","title":"Click","ns":"dom","name":"addMouseEvent","context":{"event":"click"}},{"id":"63675a30-a1a2-45c0-85b5-059bf58ebfd8","title":"AddMessage","ns":"dom","name":"appendChild"},{"id":"4087ce06-a876-49a7-9afe-5d8012143b66","title":"ToHtml","ns":"dom","name":"domify"},{"id":"ea8f0c35-cf45-48a5-a97c-ea21fae9fcd6","title":"Log","ns":"console","name":"log"},{"id":"7729647c-37f3-4e79-a729-f5d1d1e02233","title":"d","ns":"utils","name":"dummy"}],"links":[{"id":"29867ec4-9080-4e34-be92-adca4c5b3dee","source":{"id":"d23bb485-af77-4344-8586-842dbba6a979","port":"selection"},"target":{"id":"63675a30-a1a2-45c0-85b5-059bf58ebfd8","port":"element","setting":{"persist":true}},"metadata":{"title":"MessageEl selection -> element AddMessage"}},{"id":"b3452d6f-4931-46f7-85a3-fa2fb80c9852","source":{"id":"4087ce06-a876-49a7-9afe-5d8012143b66","port":"out"},"target":{"id":"63675a30-a1a2-45c0-85b5-059bf58ebfd8","port":"child"},"metadata":{"title":"ToHtml out -> child AddMessage"}},{"id":"9bd92ea3-357f-4009-b4a4-fe519f4a5227","source":{"id":"63675a30-a1a2-45c0-85b5-059bf58ebfd8","port":"element"},"target":{"id":"def9bef6-b6e3-4e00-9ef0-3c2c7da14180","port":"element"},"metadata":{"title":"AddMessage element -> element Click"}},{"id":"174f37e2-e825-47ca-9e9a-5b97d8bd3ee0","source":{"id":"d23bb485-af77-4344-8586-842dbba6a979","port":"selection"},"target":{"id":"ea8f0c35-cf45-48a5-a97c-ea21fae9fcd6","port":"msg"},"metadata":{"title":"MessageEl selection -> msg Log"}},{"id":"31ffea29-024a-4c3c-8cf0-afd832057587","source":{"id":"7729647c-37f3-4e79-a729-f5d1d1e02233","port":"out"},"target":{"id":"def9bef6-b6e3-4e00-9ef0-3c2c7da14180","port":"in"},"metadata":{"title":"d out -> in Click"}},{"id":"03281cf6-b895-4a5b-bc2d-2126c0fa7c1a","source":{"id":"6636c6c1-6d12-4a18-8d74-0364ebd98fc3","port":"out"},"target":{"id":"4087ce06-a876-49a7-9afe-5d8012143b66","port":"in"},"metadata":{"title":"View out -> in ToHtml"}}],"title":"Message Box","ns":"protocol","name":"message","ports":{"input":{"in":{"nodeId":"7729647c-37f3-4e79-a729-f5d1d1e02233","title":"In","name":"in"},"vars":{"nodeId":"6636c6c1-6d12-4a18-8d74-0364ebd98fc3","title":"Vars","name":"vars"}},"output":{"out":{"nodeId":"def9bef6-b6e3-4e00-9ef0-3c2c7da14180","title":"Out","name":"out"},"event":{"nodeId":"def9bef6-b6e3-4e00-9ef0-3c2c7da14180","title":"Event","name":"event"}}},"providers":{"@":{"url":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"provider":"./graphs/{name}.fbp"}}},"https://serve-chix.rhcloud.com/nodes/{ns}/{name}":{"console":{"log":{"_id":"52645993df5da0102500004e","name":"log","ns":"console","description":"Console log","async":true,"phrases":{"active":"Logging to console"},"ports":{"input":{"msg":{"type":"any","title":"Log message","description":"Logs a message to the console","async":true,"required":true}},"output":{"out":{"type":"any","title":"Log message"}}},"fn":"on.input.msg = function() {\n  console.log(data);\n  output( { out: data });\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"dom":{"querySelector":{"_id":"527299bb30b8af4b8910216b","name":"querySelector","ns":"dom","title":"querySelector","description":"[Document query selector](https://developer.mozilla.org/en-US/docs/Web/API/document.querySelector)","expose":["document"],"phrases":{"active":"Gathering elements matching criteria: {{input.selector}}"},"ports":{"input":{"element":{"title":"Element","type":"HTMLElement","default":null},"selector":{"title":"Selector","type":"string"}},"output":{"element":{"title":"Element","type":"HTMLElement"},"selection":{"title":"Selection","type":"HTMLElement"},"error":{"title":"Error","type":"Error"}}},"fn":"var el = input.element ? input.element : document;\noutput = {\n  element: el\n};\n\nvar selection = el.querySelector(input.selector);\nif(selection) {\n  output.selection = selection;\n} else {\n  output.error = Error('Selector ' + input.selector + ' did not match');\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"setHtml":{"_id":"52be32d46a14bb6fbd924a24","name":"setHtml","ns":"dom","description":"dom setHtml","async":true,"phrases":{"active":"Adding html"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"html":{"type":"string","format":"html","title":"html","async":true}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"}}},"fn":"on.input.html = function(data) {\n  input.element.innerHTML = data;\n  output({ element: input.element });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"addMouseEvent":{"_id":"52be4f096a14bb6fbd924a28","name":"addMouseEvent","ns":"dom","description":"Add Mouse Event Listener","async":true,"phrases":{"active":"Adding {{input.event}} handler"},"ports":{"input":{"in":{"title":"Input","type":"any","async":true,"default":null},"element":{"type":"HTMLElement","title":"Dom Element","async":true},"preventDefault":{"type":"boolean","title":"Prevent Default Event","default":true},"event":{"type":"string","enum":["click","dblclick","mousedown","mouseup","mouseover","mousemove","mouseout","dragstart","drag","dragenter","dragleave","dragover","drop","dragend"],"title":"Dom Event"}},"output":{"element":{"type":"any","title":"Element"},"out":{"type":"any","title":"Output"},"event":{"type":"MouseEvent","title":"Event"}}},"fn":"state.in = null;\nstate.event = null;\nstate.preventDefault = null;\n\nstate.clickHandler = function(ev) {\n  if(state.preventDefault) ev.preventDefault();\n  output({\n    out: state.in,\n    event: ev\n  });\n};\n\non.input.in = function() {\n  state.in = data;\n};\n\non.input.element = function() {\n\n  if (!state.in) return false;\n\n  if(state.el) {\n    state.el.removeEventListener(state.event);\n  }\n  state.el = input.element;\n  state.event = input.event;\n  state.preventDefault = input.preventDefault;\n\n  state.el.addEventListener(input.event, state.clickHandler, false);\n  output({element: input.element});\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"appendChild":{"_id":"52be32d46a14bb6fbd924a20","name":"appendChild","ns":"dom","description":"dom appendChild","async":true,"phrases":{"active":"Adding child node"},"ports":{"input":{"element":{"type":"HTMLElement","title":"Dom Element"},"child":{"type":"HTMLElement","async":true,"title":"Child Element"}},"output":{"element":{"type":"HTMLElement","title":"Dom Element"},"out":{"type":"object"}}},"fn":"on.input.child = function() {\n\n  output( {\n    element: input.element,\n    out: input.element.appendChild(data)\n  } );\n\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"domify":{"_id":"530556db041b29b9e16b1d1f","name":"domify","ns":"dom","title":"Domify","description":"Turn HTML into DOM elements x-browser","phrases":{"active":"Domifying HTML"},"ports":{"input":{"in":{"title":"Html","type":"string","format":"html","required":"true"}},"output":{"out":{"title":"Dom Elements","type":["HTMLElement","DocumentFragment"]}}},"dependencies":{"npm":{"domify":"0.x.x"}},"fn":"output.out = domify(input.in);\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"bootstrap":{"select":{"_id":"54b74927fa15e75e679fd19c","name":"select","ns":"bootstrap","title":"Select","description":"Bootstrap - select","async":true,"dependencies":{"npm":{"mustache":"latest","domify":"latest"}},"ports":{"input":{"element":{"type":"HTMLElement","title":"Parent Element","async":true},"template":{"title":"Template","type":"string","default":"<div>{{#label}}<label>{{label}}</label>{{/label}}<select id=\"{{id}}\" class=\"form-control\">{{#options}}<option value=\"{{value}}\">{{label}}</option>{{/options}}</select></div>","format":"html"},"id":{"type":"string","title":"ID","default":""},"label":{"type":"string","title":"Label","default":""},"options":{"title":"Variables","type":"array","items":{"type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"},"additionalProperties":false}}}},"output":{"element":{"title":"Element","type":"HTMLFragment"},"out":{"title":"Value","type":"object","properties":{"label":{"type":"string","title":"Label"},"value":{"type":"string","title":"Value"}}}}},"fn":"state.select = null;\nstate.view = {};\nstate.changed = function () {\n\n  var out = {};\n  var self = this;\n\n  out[this.value] = state.view.options.filter(function(opt) {\n    return opt.value === self.value;\n  }).pop();\n\n  output({out: out});\n};\n\non.input.element = function () {\n\n  if (state.select) {\n    state.select.removeEventListener('change', state.changed);\n    input.element.innerHTML = null;\n  }\n\n  state.view = {\n    id: input.id,\n    label: input.label,\n    options: input.options\n  };\n\n  var el = domify(mustache.render(input.template, state.view));\n\n  input.element.appendChild(el);\n\n  state.select = input.element.querySelector('select');\n  state.select.addEventListener('change', state.changed);\n\n  output({\n    element: input.element\n  });\n\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"button":{"_id":"54bc6765fa15e75e679fd1ac","name":"button","ns":"bootstrap","title":"Button","description":"Bootstrap - button","async":true,"ports":{"input":{"element":{"title":"Parent Element","type":"HTMLElement","async":true},"classList":{"title":"Class list","type":"string","default":"btn btn-default"},"in":{"type":"any","description":"Input to send to output when clicked","title":"Input","async":true},"label":{"type":"string","title":"Label","default":"Click!"},"attr":{"title":"Attributes","type":"object","default":{}}},"output":{"element":{"title":"Element","type":"HTMLElement"},"error":{"title":"Error","type":"Error"},"event":{"title":"Event","type":"MouseEvent"},"out":{"title":"Output","type":"any"}}},"fn":"state.el = null;\nstate.clickHandler = function(ev) {\n  output({\n    event: ev,\n    out: state.in\n  });\n};\n\non.input.element = function() {\n  if (state.el) {\n    state.el.removeEventListener('click', state.clickHandler);\n    state.el.innerHTML = null;\n  }\n  state.el = document.createElement('button');\n  state.el.setAttribute('type', 'button');\n  state.el.innerHTML = input.label;\n  state.el.className = input.classList;\n  Object.keys(input.attr).forEach(function(name) {\n    state.el.setAttribute(name, input.attr[name]);\n  });\n  state.el.addEventListener('click', state.clickHandler);\n  input.element.appendChild(state.el);\n  output({\n    element: input.element\n  });\n};\n\non.input.in = function () {\n  state.in = data;\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"json-editor":{"editor":{"_id":"54b36348b314b122580582fa","name":"editor","ns":"json-editor","title":"JSON Editor","description":"JSON Editor","async":true,"phrases":{"active":"Creating JSON Editor"},"dependencies":{"npm":{"json-editor":"psichi/json-editor"}},"ports":{"input":{"element":{"title":"Element","description":"Element","type":"HTMLElement"},"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"schema":{"title":"Schema","type":"object","description":"A valid JSON Schema to use for the editor. Version 3 and Version 4 of the draft specification are supported.","async":true},"enable":{"title":"Enable","description":"Enable","async":true},"disable":{"title":"Disable","description":"Disable","async":true},"options":{"title":"Options","type":"object","properties":{"ajax":{"title":"Ajax","description":"If true, JSON Editor will load external URLs in $ref via ajax.","type":"boolean","default":false},"disable_array_add":{"title":"Disable array add","description":"If true, remove all `add row` buttons from arrays.","type":"boolean","default":false},"disable_array_delete":{"title":"Disable array delete","description":"If true, remove all `delete row` buttons from arrays.","type":"boolean","default":false},"disable_array_reorder":{"title":"Disable array reorder","description":"If true, remove all `move up` and `move down` buttons from arrays.","type":"boolean","default":false},"disable_collapse":{"title":"Disable collapse","description":"If true, remove all collapse buttons from objects and arrays.","type":"boolean","default":false},"disable_edit_json":{"title":"Disable edit json","description":"If true, remove all Edit JSON buttons from objects.","type":"boolean","default":false},"disable_properties":{"title":"Disable properties","description":"If true, remove all Edit Properties buttons from objects.","type":"boolean","default":false},"form_name_root":{"title":"Form name root","description":"The first part of the `name` attribute of form inputs in the editor. An full example name is `root[person][name]` where `root` is the form_name_root.","type":"boolean","default":"root"},"iconlib":{"title":"Iconlib","description":"The icon library to use for the editor. See the CSS Integration section below for more info.","type":"string","enum":["bootstrap3","bootstrap2","foundation3","foundation2","jqueryui","fontawesome4","fontawesome3"],"default":null},"no_additional_properties":{"title":"No additional properties","description":"If true, objects can only contain properties defined with the properties keyword.","type":"boolean","default":false},"refs":{"title":"Refs","description":"An object containing schema definitions for URLs. Allows you to pre-define external schemas.","type":"object","default":{}},"required_by_default":{"title":"Required by default","description":"If true, all schemas that don't explicitly set the required property will be required.","type":"boolean","default":false},"show_errors":{"title":"Show errors","description":"When to show validation errors in the UI. Valid values are interaction, change, always, and never.","type":"string","enum":["interaction","change","always","never"],"default":"interaction"},"startval":{"title":"Start value","description":" Seed the editor with an initial value. This should be valid against the editor's schema.","type":"any","default":null},"template":{"title":"Template","description":"The JS template engine to use. See the Templates and Variables section below for more info.","type":"string","enum":["default","ejs","hogan","markup","mustache","swig","underscore"],"default":"default"},"theme":{"title":"Theme","description":"The CSS theme to use. See the CSS Integration section below for more info.","type":"string","enum":["html","bootstrap3","bootstrap2","foundation5","foundation4","foundation3","jqueryui"],"default":"html"}}}},"output":{"out":{"title":"out","type":"string"},"editor":{"title":"Editor","type":"JSONEditor"}}},"fn":"state.jsonEditor = null;\nstate.changeHandler = function() {\n    output({out: state.jsonEditor.getValue()});\n};\n\non.input.in = function() {\n  state.in = data;\n  if (state.jsonEditor) {\n    state.jsonEditor.setValue(state.in);\n  }\n};\n\non.input.schema = function() {\n  state.schema = input.options.schema = input.schema;\n  if (state.jsonEditor) {\n    state.jsonEditor.off('change', state.changeHandler);\n    state.jsonEditor.destroy();\n  }\n  state.jsonEditor = new json_editor(input.element, input.options);\n  // problem if state.in is not about this schema..\n  state.jsonEditor.on('ready', function() {\n    if (state.in) {\n      state.jsonEditor.setValue(state.in);\n    }\n    state.jsonEditor.on('change', state.changeHandler);\n    output({editor: state.jsonEditor});\n  });\n};\n\non.input.enable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.enable();\n  }\n};\n\non.input.disable = function() {\n  if (state.jsonEditor) {\n    state.jsonEditor.disable();\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"validate":{"_id":"54bc6c5cfa15e75e679fd1ad","name":"validate","ns":"json-editor","title":"JSON Editor Validate","description":"JSON Editor Validate","async":true,"phrases":{"active":"Validating form"},"ports":{"input":{"in":{"title":"Json","type":"object","description":"JSON Object","async":true},"editor":{"title":"Editor","type":"function","description":"JSONEditor instance"}},"output":{"out":{"title":"Output","type":"string"},"errors":{"title":"Errors","type":"array","items":{"type":"object","properties":{"path":{"title":"Path","description":"a dot separated path into the JSON object (e.g. `root.path.to.field`)","type":"string"},"property":{"title":"Property","description":"schema keyword that triggered the validation error (e.g. `minLength`)","type":"string"},"message":{"title":"Message","type":"string"}}}}}},"fn":"on.input.in = function() {\n  var errors = input.editor.validate(data);\n  if(errors.length) {\n    output({errors: errors});\n  } else {\n    output({out: data});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"object":{"keys":{"_id":"52ef3630cf8e1bab142d5394","name":"keys","ns":"object","async":true,"description":"Retrieve all the names of the object's properties","phrases":{"active":"Retrieving object properties"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true},"path":{"title":"Path","type":"string","default":null}},"output":{"out":{"title":"out","type":"array"}}},"dependencies":{"npm":{"underscore":"1.x.x","dot-object":"0.x.x"}},"fn":"on.input.in = function() {\n  var val = input.path ? dot_object().pick(input.path, data) : data;\n  output( { out: underscore.keys(val) } );\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"},"create":{"_id":"52fa908e909495ebbe6ded4c","name":"create","ns":"object","async":true,"description":"Create an object, if input is a direct object it just returns a copy of the object","phrases":{"active":"Creating object"},"ports":{"input":{"in":{"title":"Object","type":"object","async":true}},"output":{"out":{"title":"out","type":"object"}}},"fn":"on.input.in = function(data) { output({out: data}); };\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"data":{"pick":{"_id":"527d857e83f0adcc47800e7c","name":"pick","ns":"data","title":"Pick","async":true,"description":"Pick one value from an object","phrases":{"active":"Picking {{input.path}} from object"},"ports":{"input":{"in":{"title":"Object","description":"An Object, e.g { name: { first: 'John', last: 'Doe' } }","type":"object","async":true},"path":{"title":"Path","description":"Specify a path with . syntax (e.g. name.last )","type":"string","required":true}},"output":{"out":{"title":"Output","type":"any"},"error":{"title":"Error","type":"Error"}}},"dependencies":{"npm":{"dot-object":"0.x.x"}},"fn":"on.input.in = function(data) {\n  // dot_object api should be fixed..\n  var res = dot_object().pick(input.path, data);\n  if(typeof res !== 'undefined') {\n    output({out: res});\n  } else {\n    output({error: Error(input.path + ' not found')});\n  }\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"string":{"append":{"_id":"52ef363bcf8e1bab142d53b7","name":"append","ns":"string","description":"Appends a string to an other string","phrases":{"active":"Appending string"},"ports":{"input":{"in":{"title":"String","type":"string","required":true},"append":{"title":"Other String","type":"string","required":true}},"output":{"out":{"title":"String","type":"string"}}},"fn":"output.out = input.in + input.append\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"array":{"map":{"_id":"54b8835afa15e75e679fd19d","name":"map","ns":"array","async":true,"description":"Creates new array output with the results of calling the provided function on every element in this array","phrases":{"active":"Mapping array"},"ports":{"input":{"in":{"title":"Value","type":"array","async":true},"fn":{"title":"Function","type":"function","args":["val","index","array"]}},"output":{"out":{"title":"Output","type":"array"}}},"fn":"on.input.in = function() {\n  output({\n    out: data.map(input.fn)\n  });\n};\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"template":{"mustache":{"_id":"52645993df5da0102500005e","name":"mustache","ns":"template","description":"Mustache Template engine","phrases":{"active":"Compiling mustache template"},"ports":{"input":{"body":{"type":"string","format":"html","title":"Template body","description":"The body of the mustache template","required":true},"vars":{"type":"object","title":"Input variables","description":"the input variables for this template","required":true,"readonly":true}},"output":{"out":{"title":"String","type":"string"}}},"dependencies":{"npm":{"mustache":"latest"}},"fn":"output = {\n  out: mustache.render(input.body, input.vars)\n}\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}},"utils":{"dummy":{"_id":"52ef363dcf8e1bab142d53bb","name":"dummy","ns":"utils","title":"Dummy","description":"Takes an input and passes it to output.","phrases":{"active":"Dummy"},"ports":{"input":{"in":{"type":"any","title":"Input"}},"output":{"out":{"type":"any","title":"Output"}}},"fn":"output.out = input. in\n","provider":"https://serve-chix.rhcloud.com/nodes/{ns}/{name}"}}}};
 
 };
 
@@ -23985,6 +24966,8 @@ var map = {"type":"flow","nodes":[{"id":"Log","title":"Log","ns":"console","name
 var actor;
 window.Actor = actor = Flow.create(map, loader);
 
+var monitor = require('chix-monitor-npmlog').Actor;
+monitor(console, actor);
 
 function onDeviceReady() {
 actor.run();
@@ -24003,4 +24986,4 @@ if (navigator.userAgent.match(/(iPhone|iPod|iPad|Android|BlackBerry|IEMobile)/))
 // as long as this module is loaded.
 module.exports = actor;
 
-},{"chix-flow":"jXAsbI"}]},{},["gXiLoN"])
+},{"chix-flow":"jXAsbI","chix-monitor-npmlog":"HNG52E"}]},{},["gXiLoN"])

@@ -76,6 +76,10 @@ Button out -> vars Message
 
 Message out -> msg Log
 Message out -> in CommandEditor
+
+# initial value.
+# in is not required, and async so there is no initial in.
+# so it should just create a new packet I guess.
 Message event [srcElement] -> msg Log
 Message event -> msg Log
 

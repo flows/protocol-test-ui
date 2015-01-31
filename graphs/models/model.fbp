@@ -36,6 +36,7 @@ CommandsPicker out -> msg Log
 CommandsPicker out -> ^in PickSchema
 CommandKey out [0] -> path PickSchema(data/pick)
 CommandKey out -> msg Log
+PickSchema error -> msg Log
 
 <- out:schema PickSchema
 <- out:options PrepareCommand
