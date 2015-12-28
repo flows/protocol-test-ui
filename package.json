@@ -4,7 +4,9 @@
   "description": "FBP protocol tester",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "deploy": "gh-pages-deploy",
+    "clean-source": "rimraf README.md graphs package.json"
   },
   "repository": {
     "type": "git",
@@ -18,7 +20,9 @@
   "homepage": "https://github.com/flows/protocol-test-ui",
   "devDependencies": {
     "chix-flow": "^0.12.0",
-    "chix-monitor-npmlog": "0.0.5"
+    "chix-monitor-npmlog": "0.0.5",
+    "gh-pages-deploy": "^0.4.0",
+    "rimraf": "^2.5.0"
   },
   "dependencies": {
     "domify": "^1.3.1",
@@ -26,5 +30,13 @@
     "json-editor": "git://github.com/psichi/json-editor",
     "mustache": "^1.0.0",
     "underscore": "^1.7.0"
+  },
+  "gh-pages-deploy": {
+    "staticpath": "www",
+    "prep": [],
+    "post": [
+      "clean-source"
+    ],
+    "noprompt": false
   }
 }
