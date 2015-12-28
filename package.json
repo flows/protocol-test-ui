@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "deploy": "gh-pages-deploy",
-    "clean-source": "rimraf README.md graphs package.json .x.cache"
+    "clean-source": "rimraf README.md graphs package.json .x.cache .gitignore"
   },
   "repository": {
     "type": "git",
@@ -33,10 +33,6 @@
   },
   "gh-pages-deploy": {
     "staticpath": "www",
-    "prep": [],
-    "post": [
-      "clean-source"
-    ],
-    "noprompt": false
+    "post": ["clean-source"]
   }
 }
