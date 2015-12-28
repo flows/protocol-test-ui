@@ -33,6 +33,7 @@
   },
   "gh-pages-deploy": {
     "staticpath": "www",
-    "post": ["clean-source"]
+    "post": ["clean-source"],
+    "noprompt": true
   }
 }
