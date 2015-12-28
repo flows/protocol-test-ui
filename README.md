@@ -1,5 +1,9 @@
 # FBP Protocol Test Interface
 
+Example:
+
+http://flows.github.io/protocol-test-ui/
+
 Install graph dependencies:
 `fbpx install graphs/ui.fbp`
 
